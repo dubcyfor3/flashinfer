@@ -27,6 +27,7 @@ from flashinfer.jit.attention import (
     gen_single_prefill_module,
 )
 from flashinfer.utils import is_sm90a_supported, is_sm100a_supported
+from flashinfer.mla_cutedsl import BatchMLAPagedAttentionWrapperCuteDSL
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -619,6 +620,121 @@ def test_batch_mla_page_attention(
     torch.testing.assert_close(lse, lse_buffer, rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.parametrize("batch_size", [1, 7, 17])
+@pytest.mark.parametrize("kv_len", [1, 16, 128])
+@pytest.mark.parametrize("qo_len", [1])
+@pytest.mark.parametrize("num_heads", [128])
+@pytest.mark.parametrize("causal", [True])
+@pytest.mark.parametrize("page_size", [128])
+@pytest.mark.parametrize("use_cuda_graph", [False])
+@pytest.mark.parametrize("dtype", [torch.half])
+def test_batch_mla_page_attention_cute_dsl(
+    batch_size,
+    kv_len,
+    qo_len,
+    num_heads,
+    causal,
+    page_size,
+    use_cuda_graph,
+    dtype,
+):
+    """
+    Test batch MLA page attention with cute DSL implementation.
+    
+    This test demonstrates how a cute DSL can be used to express
+    complex attention patterns in a more readable and maintainable way.
+    """
+    assert is_sm100a_supported(torch.device("cuda")), "This test requires SM100A"
+    
+    if causal and qo_len > kv_len:
+        pytest.skip("qo_len > kv_len not supported for causal attention")
+    assert qo_len == 1, "qo_len must be 1 for DSL implementation"
+    
+    torch.manual_seed(42)
+    head_dim_ckv = 512
+    head_dim_kpe = 64
+    
+    # Generate test data
+    q_nope = torch.randn(
+        batch_size * qo_len, num_heads, head_dim_ckv, dtype=dtype, device="cuda"
+    )
+    q_pe = torch.randn(
+        batch_size * qo_len, num_heads, head_dim_kpe, dtype=dtype, device="cuda"
+    )
+    pages_num = math.ceil(kv_len / page_size)
+    ckv = torch.randn(
+        batch_size * pages_num,
+        page_size,
+        head_dim_ckv,
+        dtype=dtype,
+        device="cuda",
+    )
+    kpe = torch.randn(
+        batch_size * pages_num,
+        page_size,
+        head_dim_kpe,
+        dtype=dtype,
+        device="cuda",
+    )
+    
+    sm_scale = 1.0 / ((128 + 64) ** 0.5)
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda")
+    kv_lens = torch.full((batch_size,), kv_len, dtype=torch.int32, device="cuda")
+
+    # Calculate workspace size
+    # workspace_size = BlackwellMultiLatentAttentionForward.get_workspace_size(
+    #     num_heads, head_dim_ckv, batch_size, -1, cutlass.Float32
+    # )
+    workspace_buffer = torch.empty(1, dtype=torch.float32, device="cuda")
+    
+    # Create wrapper and initialize
+    wrapper = BatchMLAPagedAttentionWrapperCuteDSL(workspace_buffer)
+    
+    # Create indptr tensors for the wrapper
+    qo_indptr = torch.arange(0, batch_size + 1, dtype=torch.int32, device="cuda")
+    kv_indptr = torch.arange(0, batch_size + 1, dtype=torch.int32, device="cuda") * math.ceil(kv_len / page_size)
+    kv_indices = torch.arange(batch_size * math.ceil(kv_len / page_size), dtype=torch.int32, device="cuda")
+    
+    # Plan the computation
+    wrapper.plan(
+        qo_indptr=qo_indptr,
+        kv_indptr=kv_indptr,
+        kv_indices=kv_indices,
+        kv_len_arr=kv_lens,
+        num_heads=num_heads,
+        head_dim_ckv=head_dim_ckv,
+        head_dim_kpe=head_dim_kpe,
+        page_size=page_size,
+        causal=causal,
+        sm_scale=sm_scale,
+        q_data_type=q_nope.dtype,
+        kv_data_type=ckv.dtype,
+    )
+    
+    # Run the computation
+    o, lse = wrapper.run(
+        q_nope=q_nope,
+        q_pe=q_pe,
+        ckv_cache=ckv,
+        kpe_cache=kpe,
+        return_lse=True
+    )
+
+    # print(o.shape)
+    # print(lse.shape)
+    o = o.permute(2, 0, 1).contiguous()
+    lse = lse.permute(1, 0).contiguous()
+
+    # Validate results
+    k, v = generate_kv_from_cache(ckv, kpe, kv_len, batch_size, num_heads)
+    q = torch.cat([q_nope, q_pe], dim=-1)
+    o_ref, lse_ref = attention_ref(batch_size, q, k, v, causal, sm_scale)
+    lse_ref = lse_ref.flatten(0, 1)
+    torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
+    if kv_len != 0:
+        torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
+
+
 @pytest.mark.parametrize("batch_size", [1, 2, 4])
 @pytest.mark.parametrize("max_seq_len", [128, 1024, 4096])
 @pytest.mark.parametrize("page_size", [1, 16, 128])
@@ -707,10 +823,13 @@ def test_cutlass_mla(batch_size, max_seq_len, page_size, dtype):
 
 
 if __name__ == "__main__":
-    test_batch_mla_varlen_page_attention(
-        1, 65, 65, 65, 1, 128, True, 64, "fa2", torch.half
-    )
+    # test_batch_mla_varlen_page_attention(
+    #     1, 65, 65, 65, 1, 128, True, 64, "fa2", torch.half
+    # )
     # test_batch_mla_varlen_page_attention(
     #     155, 1024, 8, 128, 128, 16, False, 1, "fa3", torch.half
     # )
-    # test_batch_mla_page_attention(1, 1024, 128, 128, False, 1, "fa2", True, torch.half)
+    # test_batch_mla_page_attention(1, 1024, 128, 128, False, 128, "fa2", False, torch.half)
+    
+    # Test the new DSL implementation
+    test_batch_mla_page_attention_cute_dsl(8, 128, 1, 128, False, 128, False, torch.half)
