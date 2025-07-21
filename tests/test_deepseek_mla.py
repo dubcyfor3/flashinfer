@@ -682,13 +682,10 @@ def test_batch_mla_page_attention_cute_dsl(
     kv_lens = torch.full((batch_size,), kv_len, dtype=torch.int32, device="cuda")
 
     # Calculate workspace size
-    # workspace_size = BlackwellMultiLatentAttentionForward.get_workspace_size(
-    #     num_heads, head_dim_ckv, batch_size, -1, cutlass.Float32
-    # )
     workspace_buffer = torch.empty(1, dtype=torch.float32, device="cuda")
     
     # Create wrapper and initialize
-    wrapper = BatchMLAPagedAttentionWrapperCuteDSL(workspace_buffer)
+    wrapper = BatchMLAPagedAttentionWrapperCuteDSL(workspace_buffer, split_kv=-1)
     
     # Create indptr tensors for the wrapper
     qo_indptr = torch.arange(0, batch_size + 1, dtype=torch.int32, device="cuda")
@@ -720,8 +717,6 @@ def test_batch_mla_page_attention_cute_dsl(
         return_lse=True
     )
 
-    # print(o.shape)
-    # print(lse.shape)
     o = o.permute(2, 0, 1).contiguous()
     lse = lse.permute(1, 0).contiguous()
 
@@ -734,6 +729,7 @@ def test_batch_mla_page_attention_cute_dsl(
     if kv_len != 0:
         torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
 
+    print('success!')
 
 @pytest.mark.parametrize("batch_size", [1, 2, 4])
 @pytest.mark.parametrize("max_seq_len", [128, 1024, 4096])
