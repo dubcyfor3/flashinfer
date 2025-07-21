@@ -2347,7 +2347,7 @@ class BlackwellMultiLatentAttentionForward:
                 (common_params.blk_coord[0], iter_n, common_params.blk_coord[2]),
             )
             cO = cute.local_tile(
-                cute.make_identity_tensor(common_params.mAccO.shape),
+                cute.make_identity_tensor(common_params.mAccO[None, common_params.blk_coord[3], None, None].shape),
                 cta_pv_tiler_mn,
                 (common_params.blk_coord[0], iter_n, common_params.blk_coord[2]),
             )
@@ -3081,6 +3081,7 @@ class BatchMLAPagedAttentionWrapperCuteDSL:
     def __init__(
         self,
         float_workspace_buffer: torch.Tensor,
+        split_kv: int,
         use_cuda_graph: bool = False,
         qo_indptr: Optional[torch.Tensor] = None,
         kv_indptr: Optional[torch.Tensor] = None,
@@ -3090,15 +3091,6 @@ class BatchMLAPagedAttentionWrapperCuteDSL:
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
 
-        self._int_workspace_buffer = torch.empty(
-            (8 * 1024 * 1024,), dtype=torch.uint8, device=self.device
-        )
-        self._pin_memory_int_workspace_buffer = torch.empty(
-            self._int_workspace_buffer.shape,
-            dtype=self._int_workspace_buffer.dtype,
-            pin_memory=True,
-            device="cpu",
-        )
         self._use_cuda_graph = use_cuda_graph
         self._qo_indptr_buf = qo_indptr
         self._kv_indptr_buf = kv_indptr
@@ -3114,7 +3106,7 @@ class BatchMLAPagedAttentionWrapperCuteDSL:
         self._lse_dtype = cutlass.Float32
         self._mma_qk_tiler_mn = (128, 128)
         self._mma_pv_tiler_mn = (128, 256)
-        self._split_kv = -1
+        self._split_kv = split_kv
 
 
     def plan(
@@ -3180,7 +3172,7 @@ class BatchMLAPagedAttentionWrapperCuteDSL:
             self._is_var_split_kv = False
         else:
             self._is_var_seq = True
-            self._is_var_split_kv = False
+            self._is_var_split_kv = self._split_kv > 0
 
         self._batch_size = batch_size
         self._seq_len = seq_len
@@ -3308,8 +3300,6 @@ class BatchMLAPagedAttentionWrapperCuteDSL:
         # Get the raw stream pointer as a CUstream
         stream = cuda.CUstream(torch_stream.cuda_stream)
 
-        # print("debug")
-        # raise Exception("debug")
         # compile mla kernel
         compiled_mla = cute.compile(
             mla,
@@ -3516,422 +3506,4 @@ def create_tensor(
         is_dynamic_layout=is_dynamic_layout,
     )
     return cute_tensor, torch_tensor_gpu
-
-def mla_cutedsl(
-    num_heads: int,
-    latent_dim: int,
-    rope_dim: int,
-    page_size: int,
-    softmax_scale: float,
-    output_scale: float,
-    q_nope_torch: torch.Tensor,
-    q_pe_torch: torch.Tensor,
-    ckv_torch: torch.Tensor,
-    kpe_torch: torch.Tensor,
-    cache_seqs_torch: torch.Tensor,
-):
-    """Execute Multi-Latent Attention (MLA) on Blackwell architecture.
-
-    This function performs the complete MLA computation pipeline using the provided input tensors.
-    It uses fixed configuration parameters optimized for the Blackwell architecture and returns
-    both the attention output and log-sum-exp values.
-
-    :param num_heads: Number of attention heads
-    :type num_heads: int
-    :param latent_dim: Dimension of query/compressed latent
-    :type latent_dim: int
-    :param rope_dim: Dimension of query/compressed rope
-    :type rope_dim: int
-    :param page_size: Page size for the page table
-    :type page_size: int
-    :param softmax_scale: Attention score scaling factor
-    :type softmax_scale: float
-    :param output_scale: Output scaling factor
-    :type output_scale: float
-    :param q_nope_torch: Query latent tensor with shape [batch_size, num_heads, latent_dim]
-    :type q_nope_torch: torch.Tensor
-    :param q_pe_torch: Query RoPE tensor with shape [batch_size, num_heads, rope_dim]
-    :type q_pe_torch: torch.Tensor
-    :param ckv_torch: Compressed key-value tensor with shape [batch_size * pages, page_size, latent_dim]
-    :type ckv_torch: torch.Tensor
-    :param kpe_torch: Key RoPE tensor with shape [batch_size * pages, page_size, rope_dim]
-    :type kpe_torch: torch.Tensor
-    :param cache_seqs_torch: Cache sequence lengths tensor with shape [batch_size]
-    :type cache_seqs_torch: torch.Tensor
-
-    :return: Tuple of (output_tensor, lse_tensor)
-    :rtype: tuple[torch.Tensor, torch.Tensor]
-
-    :raises ValueError: If input shapes are incompatible or head dimension is unsupported
-    :raises RuntimeError: If GPU is unavailable for computation
-    """
-
-    is_persistent = True
-    is_cpasync = False
-    use_page_table = True
-    in_dtype = cutlass.Float16
-    out_dtype = cutlass.Float16
-    acc_dtype = cutlass.Float32
-    lse_dtype = cutlass.Float32
-    mma_qk_tiler_mn = (128, 128)
-    mma_pv_tiler_mn = (128, 256)
-    split_kv = -1
-    batch_size = cache_seqs_torch.shape[0]
-    seq_len = torch.max(cache_seqs_torch).item()
-
-    # check whether cache_seqs_torch is all the same
-    if torch.all(cache_seqs_torch == cache_seqs_torch[0]):
-        is_var_seq = False
-        is_var_split_kv = False
-    else:
-        is_var_seq = True
-        is_var_split_kv = False
-
-    print(f"Running Blackwell MLA test with:")
-    print(f"  batch_size: {batch_size}")
-    print(f"  seq_len: {seq_len}")
-    print(f"  num_heads: {num_heads}")
-    print(f"  latent_dim: {latent_dim}")
-    print(f"  rope_dim: {rope_dim}")
-    print(f"  in_dtype: {in_dtype}")
-    print(f"  out_dtype: {out_dtype}")
-    print(f"  acc_dtype: {acc_dtype}")
-    print(f"  mma_qk_tiler_mn: {mma_qk_tiler_mn}")
-    print(f"  mma_pv_tiler_mn: {mma_pv_tiler_mn}")
-    print(f"  split_kv: {split_kv}")
-    print(f"  is_persistent: {is_persistent}")
-    print(f"  is_cpasync: {is_cpasync}")
-    print(f"  is_var_seq: {is_var_seq}")
-    print(f"  is_var_split_kv: {is_var_split_kv}")
-    print(f"  use_page_table: {use_page_table}")
-    print(f"  page_size: {page_size}")
-    print(f"  softmax_scale: {softmax_scale}")
-    print(f"  output_scale: {output_scale}")
-
-    # Prepare pytorch tensors: Q, K, V (random from 0 to 2) and O (all zero)
-
-    torch.manual_seed(1111)
-
-
-    cache_seqs_cute = from_dlpack(cache_seqs_torch, assumed_align=16)
-    page_table_ref, page_table, page_table_gpu = create_page_table(
-        batch_size, seq_len, is_var_seq, use_page_table, page_size
-    )
-    cluster_shape_mnk = (2, 1, 1)
-    hardware_info = utils.HardwareInfo()
-    max_active_clusters = hardware_info.get_max_active_clusters(
-        cluster_shape_mnk[0] * cluster_shape_mnk[1]
-    )
-    split_kv, block_split_kvs_ref, block_split_kvs, block_split_kvs_gpu = (
-        create_block_split_kvs(
-            batch_size,
-            split_kv,
-            cache_seqs_torch,
-            is_var_split_kv,
-            mma_qk_tiler_mn,
-            cluster_shape_mnk,
-            max_active_clusters,
-        )
-    )
-
-
-    q_latent_cute = torch_to_cute(q_nope_torch, in_dtype, is_dynamic_layout=True)
-
-    q_rope_cute = torch_to_cute(q_pe_torch, in_dtype, is_dynamic_layout=True)
-
-    c_latent_cute = torch_to_cute(ckv_torch, in_dtype, is_dynamic_layout=True, page_table=page_table, page_size=page_size, cache_seqs=cache_seqs_torch)
-
-    c_rope_cute = torch_to_cute(kpe_torch, in_dtype, is_dynamic_layout=True, page_table=page_table, page_size=page_size, cache_seqs=cache_seqs_torch)
-
-    o_cute, o_torch = create_tensor(
-        batch_size, num_heads, latent_dim, out_dtype, is_dynamic_layout=True
-    )
-    lse_cute, lse_torch = create_tensor(
-        batch_size, num_heads, 1, lse_dtype, is_dynamic_layout=True, is_lse=True
-    )
-    workspace, workspace_torch = create_workspace(
-        num_heads, latent_dim, batch_size, split_kv, acc_dtype
-    )
-
-    mla = BlackwellMultiLatentAttentionForward(
-        latent_dim,
-        rope_dim,
-        acc_dtype,
-        lse_dtype,
-        mma_qk_tiler_mn,
-        mma_pv_tiler_mn,
-        max_active_clusters,
-        is_persistent,
-        is_cpasync,
-        use_page_table,
-        is_var_seq,
-        is_var_split_kv,
-    )
-
-    # Get current CUDA stream from PyTorch
-    torch_stream = torch.cuda.current_stream()
-    # Get the raw stream pointer as a CUstream
-    stream = cuda.CUstream(torch_stream.cuda_stream)
-
-    # compile mla kernel
-    compiled_mla = cute.compile(
-        mla,
-        q_latent_cute,
-        q_rope_cute,
-        c_latent_cute,
-        c_rope_cute,
-        page_table,
-        o_cute,
-        lse_cute,
-        workspace,
-        split_kv,
-        cache_seqs_cute,
-        block_split_kvs,
-        softmax_scale,
-        output_scale,
-        stream,
-    )
-
-    compiled_mla(
-            q_latent_cute,
-            q_rope_cute,
-            c_latent_cute,
-            c_rope_cute,
-            page_table,
-            o_cute,
-            lse_cute,
-            workspace,
-            split_kv,
-            cache_seqs_cute,
-            block_split_kvs,
-            softmax_scale,
-            output_scale,
-            stream,
-    )
-
-    return o_torch, lse_torch
-
-
-if __name__ == "__main__":
-
-    def parse_comma_separated_ints(s: str) -> Tuple[int, ...]:
-        try:
-            return tuple(int(x.strip()) for x in s.split(","))
-        except ValueError:
-            raise argparse.ArgumentTypeError(
-                "Invalid format. Expected comma-separated integers."
-            )
-
-    def parse_mma_tiler(s: str) -> Tuple[int, int, Tuple[int, int]]:
-        ret = parse_comma_separated_ints(s)
-        if len(ret) != 4:
-            raise argparse.ArgumentTypeError(
-                "Invalid format. Expected 4 comma-separated integers."
-            )
-        return (ret[0], ret[1], (ret[2], ret[3]))
-
-    parser = argparse.ArgumentParser(description="Example of MLA on Blackwell.")
-
-    parser.add_argument(
-        "--in_dtype",
-        type=cutlass.dtype,
-        default=cutlass.Float16,
-        help="Input data type",
-    )
-
-    parser.add_argument(
-        "--out_dtype",
-        type=cutlass.dtype,
-        default=cutlass.Float16,
-        help="Output data type",
-    )
-
-    parser.add_argument(
-        "--acc_dtype",
-        type=cutlass.dtype,
-        default=cutlass.Float32,
-        help="Accumulator data type",
-    )
-
-    parser.add_argument(
-        "--lse_dtype",
-        type=cutlass.dtype,
-        default=cutlass.Float32,
-        help="LSE data type",
-    )
-    parser.add_argument(
-        "--mma_qk_tiler_mn",
-        type=parse_mma_tiler,
-        default=(128, 128),
-        help="MMA tile shape (H, K)",
-    )
-    parser.add_argument(
-        "--mma_pv_tiler_mn",
-        type=parse_mma_tiler,
-        default=(128, 256),
-        help="MMA tile shape (H, D)",
-    )
-
-    parser.add_argument(
-        "--is_persistent",
-        action="store_true",
-        help="Is persistent",
-    )
-
-    parser.add_argument(
-        "--batch_size",
-        type=int,
-        default=8,
-        help="Batch size",
-    )
-
-    parser.add_argument(
-        "--seq_len",
-        type=int,
-        default=128,
-        help="Sequence length of K/V",
-    )
-
-    parser.add_argument(
-        "--num_heads",
-        type=int,
-        default=128,
-        help="Number of heads of Q",
-    )
-
-    parser.add_argument(
-        "--latent_dim",
-        type=int,
-        default=512,
-        help="Latent dimension of Q/C",
-    )
-
-    parser.add_argument(
-        "--rope_dim",
-        type=int,
-        default=64,
-        help="Rope dimension of Q/C",
-    )
-
-    parser.add_argument(
-        "--is_cpasync",
-        action="store_true",
-        help="Use cpasync for load or not",
-    )
-
-    parser.add_argument(
-        "--is_var_seq",
-        action="store_true",
-        help="Use variable length of sequence length or not",
-    )
-
-    parser.add_argument(
-        "--is_var_split_kv",
-        action="store_true",
-        help="Use variable length of split kv or not",
-    )
-
-    parser.add_argument(
-        "--use_page_table",
-        action="store_true",
-        default=True,
-        help="Use page table or not, must be True when is_cpasync is True",
-    )
-
-    parser.add_argument(
-        "--page_size",
-        type=int,
-        default=128,
-        help="Page size of page table",
-    )
-
-    parser.add_argument(
-        "--split_kv",
-        type=int,
-        default=-1,
-        help="Split KV setting",
-    )
-
-    parser.add_argument(
-        "--softmax_scale",
-        type=float,
-        default=1.0,
-        help="Scaling factor to scale softmax",
-    )
-
-    parser.add_argument(
-        "--output_scale",
-        type=float,
-        default=1.0,
-        help="Scaling factor to scale output",
-    )
-
-    parser.add_argument(
-        "--tolerance", type=float, default=1e-02, help="Tolerance for validation"
-    )
-
-    parser.add_argument(
-        "--warmup_iterations",
-        type=int,
-        default=0,
-        help="Number of iterations for warmup",
-    )
-
-    parser.add_argument(
-        "--iterations",
-        type=int,
-        default=1,
-        help="Number of iterations after warmup",
-    )
-
-    parser.add_argument(
-        "--skip_ref_check",
-        action="store_true",
-        help="Skip reference check",
-    )
-
-    parser.add_argument(
-        "--use_cold_l2",
-        action="store_true",
-        help="Use cold L2 cache",
-    )
-
-    args = parser.parse_args()
-
-    q_nope_torch = torch.randn(
-        args.batch_size * 1, args.num_heads, args.latent_dim, dtype=torch.half, device="cuda"
-    )
-    q_pe_torch = torch.randn(
-        args.batch_size * 1, args.num_heads, args.rope_dim, dtype=torch.half, device="cuda"
-    )
-
-    pages_num = math.ceil(args.seq_len / args.page_size)
-    ckv_torch = torch.randn(
-        args.batch_size * pages_num, args.page_size, args.latent_dim, dtype=torch.half, device="cuda"
-    )
-    kpe_torch = torch.randn(
-        args.batch_size * pages_num, args.page_size, args.rope_dim, dtype=torch.half, device="cuda"
-    )
-
-    # Create cache_seqs_torch tensor for variable sequence length
-    cache_seqs_torch = torch.full([args.batch_size], args.seq_len, dtype=torch.int32, device="cuda")
-
-    output_torch, lse_torch = mla_cutedsl(
-        args.num_heads,
-        args.latent_dim,
-        args.rope_dim,
-        args.page_size,
-        args.softmax_scale,
-        args.output_scale,
-        q_nope_torch,
-        q_pe_torch,
-        ckv_torch,
-        kpe_torch,
-        cache_seqs_torch,
-    )
-
-    print(output_torch.shape)
-    print(output_torch)
-
-    print(lse_torch.shape)
-    print(lse_torch)
+    
