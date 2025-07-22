@@ -832,4 +832,4 @@ if __name__ == "__main__":
     # test_batch_mla_page_attention(1, 1024, 128, 128, False, 128, "fa2", False, torch.half)
     
     # Test the new DSL implementation
-    test_batch_mla_page_attention_cute_dsl(8, 128, 1, 128, False, 128, False, torch.half)
+    test_batch_mla_page_attention_cute_dsl(8, 128, 1, 64, False, 128, False, torch.half)
