@@ -708,12 +708,16 @@ def test_batch_mla_page_attention_cute_dsl(
         kv_data_type=ckv.dtype,
     )
     
+    o_input = torch.empty_like(q_nope)
+    lse_input = torch.empty((batch_size, num_heads), dtype=torch.float32, device="cuda")
     # Run the computation
     o, lse = wrapper.run(
         q_nope=q_nope,
         q_pe=q_pe,
         ckv_cache=ckv,
         kpe_cache=kpe,
+        out=o_input,
+        lse=lse_input,
         return_lse=True
     )
 
