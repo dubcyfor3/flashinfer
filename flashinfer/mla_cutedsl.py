@@ -320,6 +320,7 @@ class BlackwellMultiLatentAttentionForward:
         use_page_table: bool,
         is_var_seq: bool,
         is_var_split_kv: bool,
+        use_2cta_instrs: bool,
     ):
         """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
         :param latent_dim: Latent dimension size
@@ -348,6 +349,8 @@ class BlackwellMultiLatentAttentionForward:
         :type is_var_seq: bool
         :param is_var_split_kv: Whether to use variable split KV
         :type is_var_split_kv: bool
+        :param use_2cta_instrs: Whether to use 2 CTAs instructions
+        :type use_2cta_instrs: bool
         """
 
         self.latent_dim = latent_dim
@@ -363,8 +366,8 @@ class BlackwellMultiLatentAttentionForward:
         self.use_page_table = use_page_table
         self.is_var_seq = is_var_seq
         self.is_var_split_kv = is_var_split_kv
+        self.use_2cta_instrs = use_2cta_instrs
         self.cluster_shape_mnk = (2, 1, 1)
-        self.use_2cta_instrs = True
         # When using 2 CTAs with m=128: warps 0-1 handle accumulation for first half [0, n/2),
         # while warps 2-3 handle accumulation for second half [n/2, n)
         self.warps_in_n = 2
@@ -2512,17 +2515,16 @@ class BlackwellMultiLatentAttentionForward:
             if cutlass.const_expr(self.num_heads == self.mma_pv_tiler[0]):
                 cute.autovec_copy(tR2G_rO_src, tR2G_rO_dst)
 
-            elif cutlass.const_expr(self.num_heads == self.mma_pv_tiler[0] // 2):
-                if (common_params.blk_coord[0] % 2 == 0):
-                    cute.autovec_copy(tR2G_rO_src, tR2G_rO_dst)
+            # elif cutlass.const_expr(self.num_heads == self.mma_pv_tiler[0] // 2):
+            #     if (common_params.blk_coord[0] % 2 == 0):
+            #         cute.autovec_copy(tR2G_rO_src, tR2G_rO_dst)
             else:
-                if (common_params.blk_coord[0] % 2 == 0):
-                    pred = cute.make_fragment_like(tR2G_rO_src, cutlass.Boolean)
-                    for i in range(cute.size(tR2G_rO_src.shape[0])):
-                        for j in range(cute.size(tR2G_rO_src.shape[1])):
-                            for k in range(cute.size(tR2G_rO_src.shape[2])):
-                                pred[i, j, k] = tTR_cO[i, j, k][0] < self.num_heads
-                    cute.basic_copy_if(pred, tR2G_rO_src, tR2G_rO_dst)
+                pred = cute.make_fragment_like(tR2G_rO_src, cutlass.Boolean)
+                for i in range(cute.size(tR2G_rO_src.shape[0])):
+                    for j in range(cute.size(tR2G_rO_src.shape[1])):
+                        for k in range(cute.size(tR2G_rO_src.shape[2])):
+                            pred[i, j, k] = tTR_cO[i, j, k][0] < self.num_heads
+                cute.basic_copy_if(pred, tR2G_rO_src, tR2G_rO_dst)
 
             # store the lse to global memory
             cta_pv_tiler = (
@@ -3004,8 +3006,8 @@ class BlackwellMultiLatentAttentionForward:
             return False
         if is_var_seq and not use_page_table:
             return False
-        # if H != 128:
-        #     return False
+        if H not in [128, 64, 32, 16]:
+            return False
         if K <= 0:
             return False
         return True
@@ -3104,8 +3106,6 @@ class BatchMLAPagedAttentionWrapperCuteDSL:
         self._out_dtype = cutlass.Float16
         self._acc_dtype = cutlass.Float32
         self._lse_dtype = cutlass.Float32
-        self._mma_qk_tiler_mn = (128, 128)
-        self._mma_pv_tiler_mn = (128, 256)
         self._split_kv = split_kv
 
 
@@ -3184,6 +3184,10 @@ class BatchMLAPagedAttentionWrapperCuteDSL:
         self._causal = causal
         self._sm_scale = sm_scale
         self._use_profiler = use_profiler
+        self._use_2cta_instrs = True if num_heads == 128 else False
+        self._mma_qk_tiler_mn = (128, 128)
+        self._mma_pv_tiler_mn = (128, 256)
+        self._cluster_shape_mnk = (2, 1, 1)
 
         # use input to create some random tensors
         q_nope = torch.randn(
@@ -3244,7 +3248,7 @@ class BatchMLAPagedAttentionWrapperCuteDSL:
         self._page_table_ref, self._page_table, self._page_table_gpu = create_page_table(
             batch_size, seq_len, self._is_var_seq, self._use_page_table, page_size
         )
-        cluster_shape_mnk = (2, 1, 1)
+        cluster_shape_mnk = self._cluster_shape_mnk
         hardware_info = utils.HardwareInfo()
         max_active_clusters = hardware_info.get_max_active_clusters(
             cluster_shape_mnk[0] * cluster_shape_mnk[1]
@@ -3293,6 +3297,7 @@ class BatchMLAPagedAttentionWrapperCuteDSL:
             self._use_page_table,
             self._is_var_seq,
             self._is_var_split_kv,
+            self._use_2cta_instrs,
         )
 
         # Get current CUDA stream from PyTorch
