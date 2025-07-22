@@ -61,10 +61,12 @@ def bench_deepseek_mla_decode(batch_size, seq_len, num_heads, backend):
         q_nope.dtype,
         ckv.dtype,
     )
-    o = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=False)
+    o_input = torch.empty_like(q_nope)
+    lse_input = torch.empty((batch_size, num_heads), dtype=torch.float32, device="cuda")
+    o = wrapper.run(q_nope, q_pe, ckv, kpe, out=o_input, lse=lse_input, return_lse=False)
 
     ms = triton.testing.do_bench(
-        lambda: wrapper.run(q_nope, q_pe, ckv, kpe),
+        lambda: wrapper.run(q_nope, q_pe, ckv, kpe, out=o_input, lse=lse_input, return_lse=False),
         warmup=100,
         rep=1000,
     )
@@ -125,19 +127,30 @@ def bench_deepseek_mla_decode_dsl(batch_size, seq_len, num_heads):
         q_data_type=q_nope.dtype,
         kv_data_type=ckv.dtype,
     )
-    
+    o_input = torch.empty_like(q_nope)
+    lse_input = torch.empty((batch_size, num_heads), dtype=torch.float32, device="cuda")
     # Run the computation once to warm up
     o, lse = wrapper.run(
         q_nope=q_nope,
         q_pe=q_pe,
         ckv_cache=ckv,
         kpe_cache=kpe,
+        out=o_input,
+        lse=lse_input,
         return_lse=True
     )
 
     # Benchmark the computation
     ms = triton.testing.do_bench(
-        lambda: wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=True),
+        lambda: wrapper.run(
+            q_nope=q_nope,
+            q_pe=q_pe,
+            ckv_cache=ckv,
+            kpe_cache=kpe,
+            out=o_input,
+            lse=lse_input,
+            return_lse=True,
+        ),
         warmup=100,
         rep=1000,
     )

@@ -3081,7 +3081,7 @@ class BatchMLAPagedAttentionWrapperCuteDSL:
     def __init__(
         self,
         float_workspace_buffer: torch.Tensor,
-        split_kv: int,
+        split_kv: int = -1,
         use_cuda_graph: bool = False,
         qo_indptr: Optional[torch.Tensor] = None,
         kv_indptr: Optional[torch.Tensor] = None,
@@ -3261,18 +3261,18 @@ class BatchMLAPagedAttentionWrapperCuteDSL:
             )
         )
 
-        q_latent_cute = torch_to_cute(q_nope, self._in_dtype, is_dynamic_layout=True)
+        q_latent_cute, q_latent_torch = torch_to_cute(q_nope, self._in_dtype, is_dynamic_layout=True)
 
-        q_rope_cute = torch_to_cute(q_pe, self._in_dtype, is_dynamic_layout=True)
+        q_rope_cute, q_rope_torch = torch_to_cute(q_pe, self._in_dtype, is_dynamic_layout=True)
 
-        c_latent_cute = torch_to_cute(ckv, self._in_dtype, is_dynamic_layout=True, page_table=self._page_table, page_size=self._page_size, cache_seqs=kv_len_arr)
+        c_latent_cute, c_latent_torch = torch_to_cute(ckv, self._in_dtype, is_dynamic_layout=True, page_table=self._page_table, page_size=self._page_size, cache_seqs=kv_len_arr)
 
-        c_rope_cute = torch_to_cute(kpe, self._in_dtype, is_dynamic_layout=True, page_table=self._page_table, page_size=self._page_size, cache_seqs=kv_len_arr)
+        c_rope_cute, c_rope_torch = torch_to_cute(kpe, self._in_dtype, is_dynamic_layout=True, page_table=self._page_table, page_size=self._page_size, cache_seqs=kv_len_arr)
 
-        self._o_cute, self._o_torch = create_tensor(
+        o_cute, o_torch = create_tensor(
             batch_size, num_heads, head_dim_ckv, self._out_dtype, is_dynamic_layout=True
         )
-        self._lse_cute, self._lse_torch = create_tensor(
+        lse_cute, lse_torch = create_tensor(
             batch_size, num_heads, 1, self._lse_dtype, is_dynamic_layout=True, is_lse=True,
         )
         self._workspace, self._workspace_torch = create_workspace(
@@ -3308,8 +3308,8 @@ class BatchMLAPagedAttentionWrapperCuteDSL:
             c_latent_cute,
             c_rope_cute,
             self._page_table,
-            self._o_cute,
-            self._lse_cute,
+            o_cute,
+            lse_cute,
             self._workspace,
             self._split_kv,
             self._cache_seqs_cute,
@@ -3361,20 +3361,27 @@ class BatchMLAPagedAttentionWrapperCuteDSL:
 
         assert return_lse is True, "return_lse must be True for CuteDSL implementation"
 
-        q_latent_cute = torch_to_cute(q_nope, self._in_dtype, is_dynamic_layout=True)
+        q_latent_cute, q_latent_torch = torch_to_cute(q_nope, self._in_dtype, is_dynamic_layout=True)
 
-        q_rope_cute = torch_to_cute(q_pe, self._in_dtype, is_dynamic_layout=True)
+        q_rope_cute, q_rope_torch = torch_to_cute(q_pe, self._in_dtype, is_dynamic_layout=True)
 
-        c_latent_cute = torch_to_cute(ckv_cache, self._in_dtype, is_dynamic_layout=True, page_table=self._page_table, page_size=self._page_size, cache_seqs=kv_len)
+        c_latent_cute, c_latent_torch = torch_to_cute(ckv_cache, self._in_dtype, is_dynamic_layout=True, page_table=self._page_table, page_size=self._page_size, cache_seqs=kv_len)
 
-        c_rope_cute = torch_to_cute(kpe_cache, self._in_dtype, is_dynamic_layout=True, page_table=self._page_table, page_size=self._page_size, cache_seqs=kv_len)
+        c_rope_cute, c_rope_torch = torch_to_cute(kpe_cache, self._in_dtype, is_dynamic_layout=True, page_table=self._page_table, page_size=self._page_size, cache_seqs=kv_len)
 
-        # o_cute, o_torch = create_tensor(
-        #     self._batch_size, self._num_heads, self._head_dim_ckv, self._out_dtype, is_dynamic_layout=True
-        # )
-        # lse_cute, lse_torch = create_tensor(
-        #     self._batch_size, self._num_heads, 1, self._lse_dtype, is_dynamic_layout=True, is_lse=True,
-        # )
+        if out is None:
+            o_cute, o_torch = create_tensor(
+                self._batch_size, self._num_heads, self._head_dim_ckv, self._out_dtype, is_dynamic_layout=True
+            )
+        else:
+            o_cute, o_torch = torch_to_cute(out, self._out_dtype, is_dynamic_layout=True)
+
+        if lse is None:
+            lse_cute, lse_torch = create_tensor(
+                self._batch_size, self._num_heads, 1, self._lse_dtype, is_dynamic_layout=True, is_lse=True,
+            )
+        else:
+            lse_cute, lse_torch = torch_to_cute(lse, self._lse_dtype, is_dynamic_layout=True, is_lse=True)
 
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
@@ -3384,8 +3391,8 @@ class BatchMLAPagedAttentionWrapperCuteDSL:
             c_latent_cute,
             c_rope_cute,
             self._page_table,
-            self._o_cute,
-            self._lse_cute,
+            o_cute,
+            lse_cute,
             self._workspace,
             self._split_kv,
             self._cache_seqs_cute,
@@ -3395,7 +3402,7 @@ class BatchMLAPagedAttentionWrapperCuteDSL:
             stream,
         )
 
-        return self._o_torch, self._lse_torch
+        return o_torch, lse_torch
 
 
 def ceil_div(a: int, b: int) -> int:
@@ -3409,9 +3416,20 @@ def torch_to_cute(
         page_table=None,
         page_size=None,
         cache_seqs=None,
+        is_lse=False,
     ):
-        shape = torch_tensor_gpu.shape
-        B, HK, D = shape
+        if is_lse:
+            shape = torch_tensor_gpu.shape
+            B, HK = shape
+            permute_order = (1, 0)
+            stride_order = (1, 0)
+            leading_dim = 0
+        else:
+            shape = torch_tensor_gpu.shape
+            B, HK, D = shape
+            permute_order = (1, 2, 0)
+            stride_order = (2, 0, 1)
+            leading_dim = 1
         if page_table is not None:
             if cache_seqs is not None:
                 max_seq_len = torch.max(cache_seqs)
@@ -3419,13 +3437,9 @@ def torch_to_cute(
             else:
                 shape = (B * ceil_div(HK, page_size), page_size, D)
 
-        permute_order = (1, 2, 0)
 
         # permute torch tensor according to permute_order
         torch_tensor_gpu = torch_tensor_gpu.permute(permute_order)
-
-        stride_order = (2, 0, 1)
-        leading_dim = 1
 
         # Create dtype cute tensor (gpu)
         cute_tensor = from_dlpack(torch_tensor_gpu, assumed_align=16)
@@ -3446,7 +3460,7 @@ def torch_to_cute(
             is_dynamic_layout=is_dynamic_layout,
         )
 
-        return cute_tensor
+        return cute_tensor, torch_tensor_gpu
 
 def create_tensor(
     B,
@@ -3506,4 +3520,3 @@ def create_tensor(
         is_dynamic_layout=is_dynamic_layout,
     )
     return cute_tensor, torch_tensor_gpu
-    
