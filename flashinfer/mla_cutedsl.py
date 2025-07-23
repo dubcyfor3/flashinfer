@@ -2985,9 +2985,9 @@ class BlackwellMultiLatentAttentionForward:
         """
         if L != 512 or R != 64:
             return False
-        if in_dtype not in [cutlass.Float8E4M3FN, cutlass.Float16]:
+        if in_dtype not in [cutlass.Float8E4M3FN, cutlass.Float16, cutlass.BFloat16]:
             return False
-        if out_dtype != cutlass.Float16:
+        if out_dtype not in [cutlass.Float16, cutlass.BFloat16]:
             return False
         if acc_dtype != cutlass.Float32 or lse_dtype != cutlass.Float32:
             return False
@@ -3101,8 +3101,9 @@ class BatchMLAPagedAttentionWrapperCuteDSL:
         self._is_persistent = True
         self._is_cpasync = False
         self._use_page_table = True
-        self._in_dtype = cutlass.Float16
-        self._out_dtype = cutlass.Float16
+        # Data types will be set in plan() method based on input parameters
+        self._in_dtype = None
+        self._out_dtype = None
         self._acc_dtype = cutlass.Float32
         self._lse_dtype = cutlass.Float32
         self._split_kv = split_kv
@@ -3187,19 +3188,32 @@ class BatchMLAPagedAttentionWrapperCuteDSL:
         self._mma_qk_tiler_mn = (128, 128)
         self._mma_pv_tiler_mn = (128, 256)
         self._cluster_shape_mnk = (2, 1, 1)
+        
+        # Set data types based on input parameters
+        if q_data_type == torch.bfloat16:
+            self._in_dtype = cutlass.BFloat16
+            self._out_dtype = cutlass.BFloat16
+        elif q_data_type == torch.half:
+            self._in_dtype = cutlass.Float16
+            self._out_dtype = cutlass.Float16
+        elif q_data_type == torch.float8_e4m3fn:
+            self._in_dtype = cutlass.Float8E4M3FN
+            self._out_dtype = cutlass.Float16  # Output is always Float16 for FP8 input
+        else:
+            raise ValueError(f"Unsupported input data type: {q_data_type}")
 
         # use input to create some random tensors
         q_nope = torch.randn(
-            batch_size * 1, num_heads, head_dim_ckv, dtype=torch.half, device="cuda"
+            batch_size * 1, num_heads, head_dim_ckv, dtype=q_data_type, device="cuda"
         )
         q_pe = torch.randn(
-            batch_size * 1, num_heads, head_dim_kpe, dtype=torch.half, device="cuda"
+            batch_size * 1, num_heads, head_dim_kpe, dtype=q_data_type, device="cuda"
         )
         ckv = torch.randn(
-            batch_size * pages_num, page_size, head_dim_ckv, dtype=torch.half, device="cuda"
+            batch_size * pages_num, page_size, head_dim_ckv, dtype=q_data_type, device="cuda"
         )
         kpe = torch.randn(
-            batch_size * pages_num, page_size, head_dim_kpe, dtype=torch.half, device="cuda"
+            batch_size * pages_num, page_size, head_dim_kpe, dtype=q_data_type, device="cuda"
         )
 
         if not BlackwellMultiLatentAttentionForward.can_implement(

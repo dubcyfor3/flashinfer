@@ -638,7 +638,7 @@ def test_batch_mla_page_attention(
 @pytest.mark.parametrize("causal", [True])
 @pytest.mark.parametrize("page_size", [128])
 @pytest.mark.parametrize("use_cuda_graph", [False])
-@pytest.mark.parametrize("dtype", [torch.half])
+@pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
 def test_batch_mla_page_attention_cute_dsl(
     batch_size,
     kv_len,
