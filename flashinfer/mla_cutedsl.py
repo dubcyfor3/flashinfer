@@ -321,6 +321,7 @@ class BlackwellMultiLatentAttentionForward:
         is_var_seq: bool,
         is_var_split_kv: bool,
         use_2cta_instrs: bool,
+        cluster_shape_mnk: Tuple[int, int, int],
     ):
         """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
         :param latent_dim: Latent dimension size
@@ -367,7 +368,7 @@ class BlackwellMultiLatentAttentionForward:
         self.is_var_seq = is_var_seq
         self.is_var_split_kv = is_var_split_kv
         self.use_2cta_instrs = use_2cta_instrs
-        self.cluster_shape_mnk = (2, 1, 1)
+        self.cluster_shape_mnk = cluster_shape_mnk
         # When using 2 CTAs with m=128: warps 0-1 handle accumulation for first half [0, n/2),
         # while warps 2-3 handle accumulation for second half [n/2, n)
         self.warps_in_n = 2
@@ -3006,8 +3007,6 @@ class BlackwellMultiLatentAttentionForward:
             return False
         if is_var_seq and not use_page_table:
             return False
-        if H not in [128, 64, 32, 16]:
-            return False
         if K <= 0:
             return False
         return True
@@ -3298,6 +3297,7 @@ class BatchMLAPagedAttentionWrapperCuteDSL:
             self._is_var_seq,
             self._is_var_split_kv,
             self._use_2cta_instrs,
+            self._cluster_shape_mnk,
         )
 
         # Get current CUDA stream from PyTorch
@@ -3375,18 +3375,12 @@ class BatchMLAPagedAttentionWrapperCuteDSL:
         c_rope_cute, c_rope_torch = torch_to_cute(kpe_cache, self._in_dtype, is_dynamic_layout=True, page_table=self._page_table, page_size=self._page_size, cache_seqs=kv_len)
 
         if out is None:
-            o_cute, o_torch = create_tensor(
-                self._batch_size, self._num_heads, self._head_dim_ckv, self._out_dtype, is_dynamic_layout=True
-            )
-        else:
-            o_cute, o_torch = torch_to_cute(out, self._out_dtype, is_dynamic_layout=True)
+            out = torch.empty_like(q_nope, device=q_nope.device)
+        o_cute, o_torch = torch_to_cute(out, self._out_dtype, is_dynamic_layout=True)
 
         if lse is None:
-            lse_cute, lse_torch = create_tensor(
-                self._batch_size, self._num_heads, 1, self._lse_dtype, is_dynamic_layout=True, is_lse=True,
-            )
-        else:
-            lse_cute, lse_torch = torch_to_cute(lse, self._lse_dtype, is_dynamic_layout=True, is_lse=True)
+            lse = torch.empty((self._batch_size, self._num_heads), dtype=torch.float32, device=q_nope.device)
+        lse_cute, lse_torch = torch_to_cute(lse, self._lse_dtype, is_dynamic_layout=True, is_lse=True)
 
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
