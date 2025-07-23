@@ -634,7 +634,7 @@ def test_batch_mla_page_attention(
 @pytest.mark.parametrize("batch_size", [1, 7, 17])
 @pytest.mark.parametrize("kv_len", [1, 16, 128])
 @pytest.mark.parametrize("qo_len", [1])
-@pytest.mark.parametrize("num_heads", [128])
+@pytest.mark.parametrize("num_heads", [128, 64, 32, 16, 8])
 @pytest.mark.parametrize("causal", [True])
 @pytest.mark.parametrize("page_size", [128])
 @pytest.mark.parametrize("use_cuda_graph", [False])
@@ -739,8 +739,6 @@ def test_batch_mla_page_attention_cute_dsl(
     torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
     if kv_len != 0:
         torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
-
-    print('success!')
 
 @pytest.mark.parametrize("batch_size", [1, 2, 4])
 @pytest.mark.parametrize("max_seq_len", [128, 1024, 4096])
