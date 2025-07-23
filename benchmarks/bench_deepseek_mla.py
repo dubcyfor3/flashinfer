@@ -127,16 +127,12 @@ def bench_deepseek_mla_decode_dsl(batch_size, seq_len, num_heads):
         q_data_type=q_nope.dtype,
         kv_data_type=ckv.dtype,
     )
-    o_input = torch.empty_like(q_nope)
-    lse_input = torch.empty((batch_size, num_heads), dtype=torch.float32, device="cuda")
     # Run the computation once to warm up
     o, lse = wrapper.run(
         q_nope=q_nope,
         q_pe=q_pe,
         ckv_cache=ckv,
         kpe_cache=kpe,
-        out=o_input,
-        lse=lse_input,
         return_lse=True
     )
 
@@ -147,8 +143,6 @@ def bench_deepseek_mla_decode_dsl(batch_size, seq_len, num_heads):
             q_pe=q_pe,
             ckv_cache=ckv,
             kpe_cache=kpe,
-            out=o_input,
-            lse=lse_input,
             return_lse=True,
         ),
         warmup=100,
@@ -167,7 +161,7 @@ if __name__ == "__main__":
     for seq_len in [1024, 2048, 8192]:
         for batch_size in [64, 128, 768]:
             for num_heads in [128]:
-                bench_deepseek_mla_decode(batch_size, seq_len, num_heads, "auto")
+                bench_deepseek_mla_decode(batch_size, seq_len, num_heads, "cutlass")
     
     print("\n=== CuteDSL Benchmark ===")
     for seq_len in [1024, 2048, 8192]:

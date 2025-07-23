@@ -708,16 +708,12 @@ def test_batch_mla_page_attention_cute_dsl(
         kv_data_type=ckv.dtype,
     )
     
-    o_input = torch.empty_like(q_nope)
-    lse_input = torch.empty((batch_size, num_heads), dtype=torch.float32, device="cuda")
     # Run the computation
     o, lse = wrapper.run(
         q_nope=q_nope,
         q_pe=q_pe,
         ckv_cache=ckv,
         kpe_cache=kpe,
-        out=o_input,
-        lse=lse_input,
         return_lse=True
     )
 
@@ -832,4 +828,5 @@ if __name__ == "__main__":
     # test_batch_mla_page_attention(1, 1024, 128, 128, False, 128, "fa2", False, torch.half)
     
     # Test the new DSL implementation
-    test_batch_mla_page_attention_cute_dsl(8, 128, 1, 64, False, 128, False, torch.half)
+    for num_heads in [128, 64, 32, 16, 8]:
+        test_batch_mla_page_attention_cute_dsl(8, 128, 1, num_heads, False, 128, False, torch.half)
