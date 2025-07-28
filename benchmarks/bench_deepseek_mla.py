@@ -158,11 +158,11 @@ def bench_deepseek_mla_decode_dsl(batch_size, seq_len, num_heads):
 
 
 def bench_deepseek_mla_decode_trtllm(batch_size, seq_len, num_heads):
-    # Deepseek attention config (decode-MLA) - following test configuration exactly
+    # Deepseek attention config (decode-MLA)
     qk_nope_head_dim = 128
     qk_rope_head_dim = 64
     kv_lora_rank = 512
-    page_size = 64  # TensorRT-LLM only supports page sizes 32 and 64
+    page_size = 64
     q_len_per_request = 1
     
     # Initialize query tensor [batch_size, q_len_per_request, num_heads, kv_lora_rank + qk_rope_head_dim]
