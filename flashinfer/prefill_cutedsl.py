@@ -263,7 +263,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         mma_tiler: Tuple[int, int, int],
         is_persistent: bool,
         mask_type: MaskType,
-        logits_transform: Callable | None,
+        logits_transform: Callable | None = None,
+        output_transform: Callable | None = None,
     ):
         """Initializes the configuration for a Blackwell Fused Multi-Head Attention (FMHA) kernel.
 
@@ -362,6 +363,8 @@ class BlackwellFusedMultiHeadAttentionForward:
 
         self.custom_logits_transform = True if logits_transform is not None else False
         self.logits_transform = logits_transform
+        self.custom_output_transform = True if output_transform is not None else False
+        self.output_transform = output_transform
 
     def _setup_attributes(self):
         """Set up configurations and parameters for the FMHA kernel operation.
@@ -2264,11 +2267,15 @@ class BlackwellFusedMultiHeadAttentionForward:
                 tTMEM_LOADoO[None, 0, 0, i].shape, self.pv_acc_dtype
             )
             cute.copy(tiled_tmem_load, tTMEM_LOADtO_i, tTMrO)
-            for j in range(0, cute.size(tTMrO), 2):
-                tTMrO[j], tTMrO[j + 1] = cute.arch.mul_packed_f32x2(
-                    (tTMrO[j], tTMrO[j + 1]),
-                    (scale, scale),
-                )
+            if cutlass.const_expr(not self.custom_output_transform):
+                for j in range(0, cute.size(tTMrO), 2):
+                    tTMrO[j], tTMrO[j + 1] = cute.arch.mul_packed_f32x2(
+                        (tTMrO[j], tTMrO[j + 1]),
+                        (scale, scale),
+                    )
+            else:
+                for j in range(0, cute.size(tTMrO)):
+                    tTMrO[j] = self.output_transform(tTMrO[j], scale)
             tSMrO = cute.make_fragment(tTMrO.shape, self.o_dtype)
             o_vec = tTMrO.load()
             tSMrO.store(o_vec.to(self.o_dtype))
@@ -2379,6 +2386,9 @@ class BlackwellFusedMultiHeadAttentionForward:
         grid = FmhaStaticTileScheduler.get_grid_shape(tile_sched_params)
         return tile_sched_params, grid
 
+def dumb_output_transform(x: cute.Tensor, scale: float) -> cute.Tensor:
+    return x * scale * 2.0
+
 def sigmoid_logits_transform(x: cute.Tensor) -> cute.Tensor:
     scale = 1.0 * math.log2(math.exp(1.0))
     bias = 0.0
@@ -2415,6 +2425,7 @@ class BatchPrefillCuteDSLWrapper:
         q_data_type=torch.float16,
         kv_data_type=torch.float16,
         logits_transform: Callable | None = None,
+        output_transform: Callable | None = None,
     ) -> None:
 
         if not torch.cuda.is_available():
@@ -2506,6 +2517,7 @@ class BatchPrefillCuteDSLWrapper:
             self._is_persistent,
             self._mask_type,
             logits_transform,
+            output_transform,
         )
 
         problem_size = (
