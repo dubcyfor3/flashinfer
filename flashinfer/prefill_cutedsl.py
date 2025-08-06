@@ -49,6 +49,14 @@ from cutlass.cute.typing import Int32, Int64, Float32, Boolean
 
 from typing import Callable, Any
 
+import warnings
+
+# Ignore this specific warning
+warnings.filterwarnings("ignore", message="This loop is no longer unrolled and may cause performance regression")
+
+# Or ignore all UserWarnings (more broad)
+warnings.filterwarnings("ignore", category=UserWarning)
+
 """
 A fused multi-head attention (FMHA) example for the NVIDIA Blackwell SM100 architecture using CUTE DSL
 
@@ -190,6 +198,15 @@ class FmhaStaticTileScheduler:
     ) -> Boolean:
         return current_idx * q_tiler < seqlen_q
 
+    @staticmethod
+    def check_valid_work_for_window_left(
+        k_tiler: int,
+        current_idx: Int32,
+        seqlen_k: Int32,
+        window_left: int,
+    ) -> Boolean:
+        return current_idx * k_tiler < seqlen_k + window_left
+
     def get_current_work(self, *, loc=None, ip=None) -> utils.WorkTileInfo:
         is_valid = (
             self._current_work_linear_idx < self._num_blocks
@@ -254,6 +271,7 @@ class MaskType(enum.Enum):
     NO_MASK = enum.auto()
     RESIDUAL_MASK = enum.auto()
     CAUSAL_MASK = enum.auto()
+    SLIDING_WINDOW_MASK = enum.auto()
 
 class BlackwellFusedMultiHeadAttentionForward:
     def __init__(
@@ -265,6 +283,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         mask_type: MaskType,
         logits_transform: Callable | None = None,
         output_transform: Callable | None = None,
+        window_left: int = -1,
     ):
         """Initializes the configuration for a Blackwell Fused Multi-Head Attention (FMHA) kernel.
 
@@ -365,6 +384,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.logits_transform = logits_transform
         self.custom_output_transform = True if output_transform is not None else False
         self.output_transform = output_transform
+        self.window_left = window_left
 
     def _setup_attributes(self):
         """Set up configurations and parameters for the FMHA kernel operation.
@@ -455,6 +475,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             stride=(d * h_k, 1, ((0, d), stride_b_kv)),
         )
         k = cute.make_tensor(k_iter + kv_offset, k_layout)
+        # cute.printf("k {}", k.shape)
         # (d, s, ((h_r, h_k), b)), 0-stride for h_r to broadcast
         v_layout = cute.make_layout(
             (d, s_k, ((h_r, h_k), b_kv)),
@@ -479,6 +500,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             self.cta_tiler,
             self.is_persistent,
         )
+
 
         self.q_major_mode = utils.LayoutEnum.from_tensor(q).mma_major_mode()
         self.k_major_mode = utils.LayoutEnum.from_tensor(k).mma_major_mode()
@@ -535,12 +557,14 @@ class BlackwellFusedMultiHeadAttentionForward:
             self.q_dtype,
             self.q_stage,
         )
+        print("q_smem_layout_staged", q_smem_layout_staged)
         k_smem_layout_staged = sm100_utils.make_smem_layout_b(
             qk_tiled_mma,
             self.qk_mma_tiler,
             self.k_dtype,
             self.kv_stage,
         )
+        # cute.printf("k_smem_layout_staged {}", k_smem_layout_staged)
         p_tmem_layout_staged = sm100_utils.make_smem_layout_a(
             pv_tiled_mma,
             self.pv_mma_tiler,
@@ -565,6 +589,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         tma_store_op = cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp()
 
         q_smem_layout = cute.select(q_smem_layout_staged, mode=[0, 1, 2])
+        print("q_smem_layout", q_smem_layout)
         tma_atom_q, tma_tensor_q = cute.nvgpu.make_tiled_tma_atom_A(
             tma_load_op,
             q,
@@ -861,6 +886,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         sK = storage.sK.get_tensor(
             k_smem_layout_staged.outer, swizzle=k_smem_layout_staged.inner
         )
+        cute.printf("sK {}", sK.shape)
         # (MMA, MMA_K, MMA_D, PIPE)
         # Strip swizzle info to reuse smem
         sV_ptr = cute.recast_ptr(sK.iterator, v_smem_layout_staged.inner)
@@ -886,6 +912,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         tStS1 = cute.make_tensor(tStS.iterator + self.tmem_s1_offset, tStS.layout)
         tOtO0 = cute.make_tensor(tOtO.iterator + self.tmem_o0_offset, tOtO.layout)
         tOtO1 = cute.make_tensor(tOtO.iterator + self.tmem_o1_offset, tOtO.layout)
+
+        # cute.printf("tStS0 {}", tStS0.shape)
 
         tP = cute.make_tensor(tStS.iterator, p_tmem_layout_staged.outer)
         tOrP = pv_thr_mma.make_fragment_A(tP)[None, None, None, 0]
@@ -922,6 +950,8 @@ class BlackwellFusedMultiHeadAttentionForward:
 
             while work_tile.is_valid_tile:
                 curr_block_coord = work_tile.tile_idx
+                # block_coord = (mid, 0, (hid, bid))
+                # cute.printf("curr_block_coord {}", curr_block_coord)
                 batch_coord = curr_block_coord[2][1]
                 continue_cond = False
                 cuseqlen_q = Int32(0)
@@ -1029,7 +1059,9 @@ class BlackwellFusedMultiHeadAttentionForward:
                         tma_bar_ptr=q0_handle.barrier,
                     )
                     # K0
-                    kv_coord = 0  # seqlen_kv_loop
+                    kv_coord = self.get_kv_start_block_idx(curr_block_coord, self.cta_tiler, seqlen_k)  # seqlen_kv_loop
+
+                    # cute.printf("tKgK {}", tKgK.shape)
                     k_handle = load_kv_producer.acquire_and_advance()
                     cute.copy(
                         tma_atom_k,
@@ -1060,9 +1092,11 @@ class BlackwellFusedMultiHeadAttentionForward:
                         self.get_trip_count(curr_block_coord, self.cta_tiler, seqlen_k)
                         - 1
                     )
+                    # cute.printf("seqlen_kv_loop_steps {}", seqlen_kv_loop_steps)
                     for i in cutlass.range(0, seqlen_kv_loop_steps, 1, unroll=1):
                         # Ki
                         k_handle = load_kv_producer.acquire_and_advance()
+                        # cute.printf("k_handle {}", k_handle.index)
                         cute.copy(
                             tma_atom_k,
                             tKgK[None, kv_coord],
@@ -1134,6 +1168,9 @@ class BlackwellFusedMultiHeadAttentionForward:
                     s0_handle = mma_s0_producer.acquire_and_advance()
                     # 4. gemm
                     num_kphases = cute.size(tSrQ0, mode=[2])
+                    # cute.printf("tSrQ0 {}", tSrQ0.shape)
+                    # cute.printf("tSrK {}", tSrK.shape)
+                    # cute.printf("num_kphases {}", num_kphases)
                     for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
                         kphase_coord_0 = (None, None, kphase_idx)
                         qk_tiled_mma.set(tcgen05.Field.ACCUMULATE, kphase_idx != 0)
@@ -1742,6 +1779,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         cute.copy(tiled_tmem_load, tTMEM_LOADtS, tTMEM_LOADrS)
         if need_apply_mask:
             self.apply_mask(tTMEM_LOADrS, tTMEM_LOADcS, seqlen_k)
+        print("tTMEM_LOADrS", tTMEM_LOADrS.shape)
 
         old_row_max = row_max
         if cutlass.const_expr(not self.custom_logits_transform):
@@ -1755,6 +1793,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         tTMEM_STORE_VECrS = cute.make_fragment(
             tTMEM_STORE_VECcS.shape, self.qk_acc_dtype
         )
+        print("tTMEM_STORE_VECrS", tTMEM_STORE_VECrS.shape)
         tTMEM_STORE_VECrS[0] = old_row_max
         tTMEM_STORE_VECrS[1] = row_max_safe
         cute.copy(tiled_tmem_store_vec, tTMEM_STORE_VECrS, tTMEM_STORE_VECtS)
@@ -2048,6 +2087,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                         atom_args,
                         tensor_args,
                     )
+                cute.printf("cta tiler: {}", self.cta_tiler)
                 mask_count = self.get_masked_trip_count(
                     curr_block_coord,
                     self.cta_tiler,
@@ -2305,6 +2345,12 @@ class BlackwellFusedMultiHeadAttentionForward:
                 (blk_coord[0] + 1) * tile_shape[0], tile_shape[1]
             )
             result = cutlass.min(max_blocks_k, max_blocks_q)
+        elif self.mask_type == MaskType.SLIDING_WINDOW_MASK:
+            max_blocks_k = cute.ceil_div(self.window_left, tile_shape[1]) + 1
+            max_blocks_q = cute.ceil_div(
+                (blk_coord[0] + 1) * tile_shape[0], tile_shape[1]
+            )
+            result = cutlass.min(max_blocks_k, max_blocks_q)
         return result
 
     @cute.jit
@@ -2328,6 +2374,9 @@ class BlackwellFusedMultiHeadAttentionForward:
                 trip_count,
                 cute.ceil_div(tile_shape[0], tile_shape[1]),
             )
+        elif self.mask_type == MaskType.SLIDING_WINDOW_MASK:
+            trip_count = self.get_trip_count(blk_coord, tile_shape, seqlen_k)
+            result = trip_count
         return result
 
     @cute.jit
@@ -2349,7 +2398,26 @@ class BlackwellFusedMultiHeadAttentionForward:
             result = self.get_trip_count(
                 blk_coord, tile_shape, seqlen_k
             ) - self.get_masked_trip_count(blk_coord, tile_shape, seqlen_k)
+        elif self.mask_type == MaskType.SLIDING_WINDOW_MASK:
+            result = 0
         return result
+
+
+    @cute.jit
+    def get_kv_start_block_idx(
+        self,
+        blk_coord: cute.Coord,
+        tile_shape: cute.Shape,
+        seqlen_k: Int32,
+    ) -> Int32:
+        if cutlass.const_expr(self.mask_type == MaskType.SLIDING_WINDOW_MASK):
+            num_blocks_k = cute.ceil_div(self.window_left, tile_shape[1])
+            block_idx = cute.ceil_div(
+                (blk_coord[0] + 1) * tile_shape[0], tile_shape[1]
+            ) - 1
+            return cutlass.max(0, block_idx - num_blocks_k)
+        else:
+            return 0
 
     @cute.jit
     def apply_mask(
@@ -2367,6 +2435,11 @@ class BlackwellFusedMultiHeadAttentionForward:
             for i in range(cute.size(acc_qk)):
                 pos = index_qk[i]
                 if pos[0] < pos[1] or pos[1] >= seqlen_k:
+                    acc_qk[i] = -Float32.inf
+        elif self.mask_type == MaskType.SLIDING_WINDOW_MASK:
+            for i in range(cute.size(acc_qk)):
+                pos = index_qk[i]
+                if pos[1] - pos[0] > self.window_left:
                     acc_qk[i] = -Float32.inf
 
     @staticmethod
@@ -2426,6 +2499,7 @@ class BatchPrefillCuteDSLWrapper:
         kv_data_type=torch.float16,
         logits_transform: Callable | None = None,
         output_transform: Callable | None = None,
+        window_left: int = -1,
     ) -> None:
 
         if not torch.cuda.is_available():
@@ -2500,6 +2574,8 @@ class BatchPrefillCuteDSLWrapper:
         self._mask_type = MaskType.NO_MASK
         if self._causal:
             self._mask_type = MaskType.CAUSAL_MASK
+        elif window_left > 0:
+            self._mask_type = MaskType.SLIDING_WINDOW_MASK
         else:
             if s_k.shape[0] > 1:
                 for i in range(len(s_k)):
@@ -2518,6 +2594,7 @@ class BatchPrefillCuteDSLWrapper:
             self._mask_type,
             logits_transform,
             output_transform,
+            window_left,
         )
 
         problem_size = (

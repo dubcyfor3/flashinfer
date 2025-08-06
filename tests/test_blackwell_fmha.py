@@ -435,6 +435,7 @@ def test_blackwell_cutedsl_fmha(
         sm_scale=sm_scale,
         q_data_type=dtype,
         kv_data_type=dtype,
+        window_left=10,
     )
     o = wrapper.run(q, k, v)
 
@@ -635,28 +636,28 @@ if __name__ == "__main__":
         False,
         torch.float16,
     )
-    test_blackwell_cutedsl_fmha_logits_transform(
-        4,
-        1024,
-        1024,
-        32,
-        32,
-        128,
-        128,
-        True,
-        torch.float16,
-    )
-    test_blackwell_cutedsl_fmha_output_transform(
-        4,
-        1024,
-        1024,
-        32,
-        32,
-        128,
-        128,
-        True,
-        torch.float16,
-    )
+    # test_blackwell_cutedsl_fmha_logits_transform(
+    #     4,
+    #     1024,
+    #     1024,
+    #     32,
+    #     32,
+    #     128,
+    #     128,
+    #     True,
+    #     torch.float16,
+    # )
+    # test_blackwell_cutedsl_fmha_output_transform(
+    #     4,
+    #     1024,
+    #     1024,
+    #     32,
+    #     32,
+    #     128,
+    #     128,
+    #     True,
+    #     torch.float16,
+    # )
     # test_blackwell_cutlass_fmha(
     #     9,
     #     377,
