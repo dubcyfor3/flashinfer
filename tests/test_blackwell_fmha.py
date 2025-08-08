@@ -579,9 +579,8 @@ def test_blackwell_cutedsl_fmha_output_transform(
     dtype,
 ):
 
-    import cutlass.cute as cute
-    def dumb_output_transform(x: cute.Tensor, scale: float) -> cute.Tensor:
-        return x * scale * 2.0
+    def dumb_output_transform(params, output, batch_idx, qo_idx, qo_head_idx, m, d, scale):
+        return output * scale * 2.0
 
     if qo_len > kv_len and causal:
         pytest.skip("qo_len > kv_len and causal is not supported")

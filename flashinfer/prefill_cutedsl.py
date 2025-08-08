@@ -1540,6 +1540,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             tStS_vec0 = cute.make_tensor(
                 tStS.iterator + self.tmem_vec0_offset, tStS_vec_layout
             )
+            # cute.printf("tStS_vec0: {}", tStS_vec0)
             tStS_vec1 = cute.make_tensor(
                 tStS.iterator + self.tmem_vec1_offset, tStS_vec_layout
             )
@@ -1568,6 +1569,10 @@ class BlackwellFusedMultiHeadAttentionForward:
             while work_tile.is_valid_tile:
                 curr_block_coord = work_tile.tile_idx
                 batch_coord = curr_block_coord[2][1]
+                head_coord = curr_block_coord[2][0]
+                qo_idx_offset = curr_block_coord[0] * self.cta_tiler[0]
+                # qo_head_idx = head_coord
+
                 seqlen_k = mK_kdl.shape[0]
                 continue_cond = False
 
@@ -1647,15 +1652,22 @@ class BlackwellFusedMultiHeadAttentionForward:
                     # wait for o0
                     o0_handle = mma_corr_consumer.wait_and_advance()
                     o0_final_handle = corr_epi_producer.acquire_and_advance()
-                    if cutlass.const_expr(not self.custom_logits_transform):
-                        epilogue_scale = scale_output / tTMEM_LOAD_VECrS[0]
-                    else:
-                        epilogue_scale = scale_output
+                    # if cutlass.const_expr(not self.custom_logits_transform):
+                    #     epilogue_scale = scale_output / tTMEM_LOAD_VECrS[0]
+                    # else:
+                    d = tTMEM_LOAD_VECrS[0] # row sum
+                    m = tTMEM_LOAD_VECrS[1] # row max
+                    epilogue_scale = scale_output
                     self.correction_epilog(
                         pv_thr_mma,
                         tOtO0,
                         epilogue_scale,
+                        m,
+                        d,
                         sO[None, None, 0],
+                        batch_coord,
+                        head_coord,
+                        qo_idx_offset,
                     )
                     o0_handle.release()
                     o0_final_handle.commit()
@@ -1677,6 +1689,9 @@ class BlackwellFusedMultiHeadAttentionForward:
                         tOtO1,
                         epilogue_scale,
                         sO[None, None, 1],
+                        batch_coord,
+                        head_coord,
+                        qo_idx_offset + self.qk_mma_tiler[0],
                     )
                     o1_handle.release()
                     o1_final_handle.commit()
@@ -1785,13 +1800,10 @@ class BlackwellFusedMultiHeadAttentionForward:
         # print("tTMEM_LOADrS", tTMEM_LOADrS.shape)
 
         old_row_max = row_max
-        if cutlass.const_expr(not self.custom_logits_transform):
-            row_max = tTMEM_LOADrS.load().reduce(cute.ReductionOp.MAX, row_max, 0)
-            row_max_safe = row_max
-            if row_max == -cutlass.Float32.inf:
-                row_max_safe = 0.0
-        else:
-            row_max = 0.0
+        row_max = tTMEM_LOADrS.load().reduce(cute.ReductionOp.MAX, row_max, 0)
+        row_max_safe = row_max
+        # cute.printf("row_max: {}", row_max)
+        if row_max == -cutlass.Float32.inf:
             row_max_safe = 0.0
         tTMEM_STORE_VECrS = cute.make_fragment(
             tTMEM_STORE_VECcS.shape, self.qk_acc_dtype
@@ -1859,42 +1871,39 @@ class BlackwellFusedMultiHeadAttentionForward:
         # Notify tensor core warp that softmax(S->P) is ready
         si_handle.release()
 
-        ### di = di-1 * (e^(mi-1 - mi) * scale) + e^(xi*scale - mi*scale)
+        ### di = di-1 * (e^(mi-1 - mi) * scale) + sum e^(xi*scale - mi*scale)
         vec_i_handle = si_corr_producer.acquire_and_advance()
-        if cutlass.const_expr(not self.custom_logits_transform):
-            acc_scale_ = scale * (old_row_max - row_max_safe)
-            acc_scale = cute.arch.exp2(acc_scale_) * 0.5
-            row_sum *= acc_scale
-            local_row_sum_0 = (row_sum, row_sum)
-            local_row_sum_1 = (0.0, 0.0)
-            local_row_sum_2 = (0.0, 0.0)
-            local_row_sum_3 = (0.0, 0.0)
+        acc_scale_ = scale * (old_row_max - row_max_safe)
+        acc_scale = cute.arch.exp2(acc_scale_) * 0.5
+        row_sum *= acc_scale
+        local_row_sum_0 = (row_sum, row_sum)
+        local_row_sum_1 = (0.0, 0.0)
+        local_row_sum_2 = (0.0, 0.0)
+        local_row_sum_3 = (0.0, 0.0)
 
-            reduction_unroll = 4
-            frg_tile = cute.size(tTMEM_LOADrS) // reduction_unroll
-            tTMEM_LOADrS_frg = cute.logical_divide(tTMEM_LOADrS, cute.make_layout(frg_tile))
+        reduction_unroll = 4
+        frg_tile = cute.size(tTMEM_LOADrS) // reduction_unroll
+        tTMEM_LOADrS_frg = cute.logical_divide(tTMEM_LOADrS, cute.make_layout(frg_tile))
 
-            for j in cutlass.range_constexpr(0, cute.size(tTMEM_LOADrS_frg, mode=[0]), 2):
-                local_row_sum_0 = cute.arch.add_packed_f32x2(
-                    local_row_sum_0, (tTMEM_LOADrS_frg[j, 0], tTMEM_LOADrS_frg[j + 1, 0])
-                )
-                local_row_sum_1 = cute.arch.add_packed_f32x2(
-                    local_row_sum_1, (tTMEM_LOADrS_frg[j, 1], tTMEM_LOADrS_frg[j + 1, 1])
-                )
-                local_row_sum_2 = cute.arch.add_packed_f32x2(
-                    local_row_sum_2, (tTMEM_LOADrS_frg[j, 2], tTMEM_LOADrS_frg[j + 1, 2])
-                )
-                local_row_sum_3 = cute.arch.add_packed_f32x2(
-                    local_row_sum_3, (tTMEM_LOADrS_frg[j, 3], tTMEM_LOADrS_frg[j + 1, 3])
-                )
+        for j in cutlass.range_constexpr(0, cute.size(tTMEM_LOADrS_frg, mode=[0]), 2):
+            local_row_sum_0 = cute.arch.add_packed_f32x2(
+                local_row_sum_0, (tTMEM_LOADrS_frg[j, 0], tTMEM_LOADrS_frg[j + 1, 0])
+            )
+            local_row_sum_1 = cute.arch.add_packed_f32x2(
+                local_row_sum_1, (tTMEM_LOADrS_frg[j, 1], tTMEM_LOADrS_frg[j + 1, 1])
+            )
+            local_row_sum_2 = cute.arch.add_packed_f32x2(
+                local_row_sum_2, (tTMEM_LOADrS_frg[j, 2], tTMEM_LOADrS_frg[j + 1, 2])
+            )
+            local_row_sum_3 = cute.arch.add_packed_f32x2(
+                local_row_sum_3, (tTMEM_LOADrS_frg[j, 3], tTMEM_LOADrS_frg[j + 1, 3])
+            )
 
-            local_row_sum_0 = cute.arch.add_packed_f32x2(local_row_sum_0, local_row_sum_1)
-            local_row_sum_2 = cute.arch.add_packed_f32x2(local_row_sum_2, local_row_sum_3)
-            local_row_sum_0 = cute.arch.add_packed_f32x2(local_row_sum_0, local_row_sum_2)
-            row_sum = local_row_sum_0[0] + local_row_sum_0[1]
-        
-        else:
-            row_sum = 0.0
+        local_row_sum_0 = cute.arch.add_packed_f32x2(local_row_sum_0, local_row_sum_1)
+        local_row_sum_2 = cute.arch.add_packed_f32x2(local_row_sum_2, local_row_sum_3)
+        local_row_sum_0 = cute.arch.add_packed_f32x2(local_row_sum_0, local_row_sum_2)
+        row_sum = local_row_sum_0[0] + local_row_sum_0[1]
+        cute.printf("row_sum: {}", row_sum)
 
         return (
             row_max,
@@ -2245,7 +2254,12 @@ class BlackwellFusedMultiHeadAttentionForward:
         thr_mma: cute.core.ThrMma,
         tOtO: cute.Tensor,
         scale: Float32,
+        m: Float32,
+        d: Float32,
         sO: cute.Tensor,
+        batch_coord: Int32,
+        head_coord: Int32,
+        qo_idx_offset: Int32,
     ):
         """Apply final scaling and transformation to attention output before writing to global memory.
 
@@ -2269,20 +2283,28 @@ class BlackwellFusedMultiHeadAttentionForward:
         :param sO: Shared memory tensor for the final output
         :type sO: cute.Tensor
         """
+        if cutlass.const_expr(not self.custom_output_transform):
+            scale = scale / d
 
         pv_tiled_mma_shape = (
             self.pv_mma_tiler[0],
             self.pv_mma_tiler[1],
         )
         cO = cute.make_identity_tensor(pv_tiled_mma_shape)
+        if cutlass.const_expr(self.custom_output_transform):
+            cO_custom = cute.make_identity_tensor(pv_tiled_mma_shape)
 
         corr_tile_size = 32 * 8 // self.o_dtype.width
         tOsO = thr_mma.partition_C(sO)
         tOcO = thr_mma.partition_C(cO)
+        if cutlass.const_expr(self.custom_output_transform):
+            tOcO_custom = thr_mma.partition_C(cO_custom)
 
         tOtO_i = cute.logical_divide(tOtO, cute.make_layout((128, corr_tile_size)))
         tOcO_i = cute.logical_divide(tOcO, cute.make_layout((128, corr_tile_size)))
         tOsO_i = cute.logical_divide(tOsO, cute.make_layout((128, corr_tile_size)))
+        if cutlass.const_expr(self.custom_output_transform):
+            tOcO_custom_i = cute.logical_divide(tOcO_custom, cute.make_layout((128, corr_tile_size)))
         tidx, _, _ = cute.arch.thread_idx()
         thread_idx = tidx % (self.threads_per_warp * len(self.correction_warp_ids))
 
@@ -2309,6 +2331,9 @@ class BlackwellFusedMultiHeadAttentionForward:
         tTMEM_LOADtO = thr_tmem_load.partition_S(tOtO_i[(None, None), None])
         tTMEM_LOADsO = thr_tmem_load.partition_D(tOsO_i[(None, None), None])
         tTMEM_LOADoO = thr_tmem_load.partition_D(tOcO_i[(None, None), None])
+        if cutlass.const_expr(self.custom_output_transform):
+            tTMEM_LOADcO_custom = thr_tmem_load.partition_D(tOcO_custom_i[(None, None), None])
+
 
         for i in range(self.cta_tiler[2] // corr_tile_size):
             tTMEM_LOADtO_i = tTMEM_LOADtO[None, 0, 0, i]
@@ -2324,8 +2349,11 @@ class BlackwellFusedMultiHeadAttentionForward:
                         (scale, scale),
                     )
             else:
+                tTMcO_custom = tTMEM_LOADcO_custom[None, 0, 0, i]
                 for j in range(0, cute.size(tTMrO)):
-                    tTMrO[j] = self.output_transform(tTMrO[j], scale)
+                    qo_idx = qo_idx_offset + tTMcO_custom[j][0]
+                    print(f"qo_idx: {qo_idx}")
+                    tTMrO[j] = self.output_transform(None, tTMrO[j], batch_coord, qo_idx, head_coord, m, d, scale)
             tSMrO = cute.make_fragment(tTMrO.shape, self.o_dtype)
             o_vec = tTMrO.load()
             tSMrO.store(o_vec.to(self.o_dtype))
