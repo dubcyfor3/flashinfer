@@ -20,8 +20,18 @@ def attention_ref(
     qo_len = q.shape[0] // batch_size
     kv_len = k.shape[0] // batch_size
     num_qo_heads = q.shape[1]
+    num_kv_heads = k.shape[1]
     head_dim_qk = q.shape[2]
     head_dim_vo = v.shape[2]
+    
+    # Handle GQA: if num_qo_heads > num_kv_heads, repeat K and V to match Q shape
+    if num_qo_heads > num_kv_heads:
+        assert num_qo_heads % num_kv_heads == 0, f"num_qo_heads ({num_qo_heads}) must be divisible by num_kv_heads ({num_kv_heads}) for GQA"
+        group_size = num_qo_heads // num_kv_heads
+        k = torch.repeat_interleave(k, group_size, dim=1)  # (batch * kv_len, num_qo_heads, head_dim_qk)
+        v = torch.repeat_interleave(v, group_size, dim=1)  # (batch * kv_len, num_qo_heads, head_dim_vo)
+    
+    # Now all tensors have the same number of heads, use standard attention logic
     logits = (
         torch.einsum(
             "bmhd,bnhd->bhmn",
@@ -53,6 +63,7 @@ def attention_ref(
     )
 
     return o_ref, lse_ref * math.log2(math.e)
+
 
 
 def attention_varlen_ref(
@@ -98,8 +109,18 @@ def attention_sigmoid_ref(
     qo_len = q.shape[0] // batch_size
     kv_len = k.shape[0] // batch_size
     num_qo_heads = q.shape[1]
+    num_kv_heads = k.shape[1]
     head_dim_qk = q.shape[2]
     head_dim_vo = v.shape[2]
+    
+    # Handle GQA: if num_qo_heads > num_kv_heads, repeat K and V to match Q shape
+    if num_qo_heads > num_kv_heads:
+        assert num_qo_heads % num_kv_heads == 0, f"num_qo_heads ({num_qo_heads}) must be divisible by num_kv_heads ({num_kv_heads}) for GQA"
+        group_size = num_qo_heads // num_kv_heads
+        k = torch.repeat_interleave(k, group_size, dim=1)  # (batch * kv_len, num_qo_heads, head_dim_qk)
+        v = torch.repeat_interleave(v, group_size, dim=1)  # (batch * kv_len, num_qo_heads, head_dim_vo)
+    
+    # Now all tensors have the same number of heads, use standard attention logic
     logits = (
         torch.einsum(
             "bmhd,bnhd->bhmn",
@@ -435,15 +456,13 @@ def test_blackwell_cutedsl_fmha(
         sm_scale=sm_scale,
         q_data_type=dtype,
         kv_data_type=dtype,
-        window_left=10,
     )
     o = wrapper.run(q, k, v)
-
-    gqa_group_ratio = num_qo_heads // num_kv_heads
-    k_repeated = torch.repeat_interleave(k, gqa_group_ratio, dim=1)
-    v_repeated = torch.repeat_interleave(v, gqa_group_ratio, dim=1)
+    # special repeat order for cutedsl impl layout
+    k_repeat = k.repeat(1, num_qo_heads // num_kv_heads, 1)
+    v_repeat = v.repeat(1, num_qo_heads // num_kv_heads, 1)
     o_ref, lse_ref = attention_ref(
-        batch_size, q, k_repeated, v_repeated, causal, sm_scale
+        batch_size, q, k_repeat, v_repeat, causal, sm_scale
     )
 
     if dtype == torch.half:
@@ -476,7 +495,7 @@ def test_blackwell_cutedsl_fmha_logits_transform(
 ):
 
     import cutlass.cute as cute
-    def sigmoid_logits_transform(x: cute.Tensor) -> cute.Tensor:
+    def sigmoid_logits_transform(params, x: cute.Tensor, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx) -> cute.Tensor:
         scale = 1.0 * math.log2(math.exp(1.0))
         bias = 0.0
         return 1 / (1 + cute.arch.exp2(-(x * scale + bias)))
@@ -523,12 +542,12 @@ def test_blackwell_cutedsl_fmha_logits_transform(
     o = wrapper.run(q, k, v)
 
     gqa_group_ratio = num_qo_heads // num_kv_heads
-    k_repeated = torch.repeat_interleave(k, gqa_group_ratio, dim=1)
-    v_repeated = torch.repeat_interleave(v, gqa_group_ratio, dim=1)
+    k_repeat = k.repeat(1, gqa_group_ratio, 1)
+    v_repeat = v.repeat(1, gqa_group_ratio, 1)
     
     # Use sigmoid-based attention reference instead of softmax
     o_ref = attention_sigmoid_ref(
-        batch_size, q, k_repeated, v_repeated, causal, 1.0, 0.0
+        batch_size, q, k_repeat, v_repeat, causal, 1.0, 0.0
     )
 
     if dtype == torch.half:
@@ -606,12 +625,12 @@ def test_blackwell_cutedsl_fmha_output_transform(
     o = wrapper.run(q, k, v)
 
     gqa_group_ratio = num_qo_heads // num_kv_heads
-    k_repeated = torch.repeat_interleave(k, gqa_group_ratio, dim=1)
-    v_repeated = torch.repeat_interleave(v, gqa_group_ratio, dim=1)
+    k_repeat = k.repeat(1, gqa_group_ratio, 1)
+    v_repeat = v.repeat(1, gqa_group_ratio, 1)
     
     # Use sigmoid-based attention reference instead of softmax
     o_ref, _ = attention_ref(
-        batch_size, q, k_repeated, v_repeated, causal, 1.0
+        batch_size, q, k_repeat, v_repeat, causal, 1.0
     )
     o_ref_transform = o_ref * 2.0
 
@@ -624,7 +643,19 @@ def test_blackwell_cutedsl_fmha_output_transform(
 
 
 if __name__ == "__main__":
-    test_blackwell_cutedsl_fmha(
+    # test_blackwell_cutedsl_fmha(
+    #     4,
+    #     1024,
+    #     1024,
+    #     32,
+    #     8,
+    #     128,
+    #     128,
+    #     1,
+    #     False,
+    #     torch.float16,
+    # )
+    test_blackwell_cutedsl_fmha_logits_transform(
         4,
         1024,
         1024,
@@ -632,21 +663,9 @@ if __name__ == "__main__":
         32,
         128,
         128,
-        1,
-        False,
+        True,
         torch.float16,
     )
-    # test_blackwell_cutedsl_fmha_logits_transform(
-    #     4,
-    #     1024,
-    #     1024,
-    #     32,
-    #     32,
-    #     128,
-    #     128,
-    #     True,
-    #     torch.float16,
-    # )
     # test_blackwell_cutedsl_fmha_output_transform(
     #     4,
     #     1024,

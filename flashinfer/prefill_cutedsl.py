@@ -116,6 +116,7 @@ class FmhaStaticTileSchedulerParams:
     ):
         self.is_persistent = is_persistent
         self.problem_shape_mbh = problem_shape_mbh
+        # cute.printf("problem_shape_mbh {}", problem_shape_mbh)
         self._loc = loc
         self._ip = ip
 
@@ -141,6 +142,7 @@ def create_fmha_static_tile_scheduler_params(
     is_persistent: bool,
     problem_shape_mbh: cute.Shape,
 ) -> FmhaStaticTileSchedulerParams:
+    cute.printf("problem_shape_mbh {}", problem_shape_mbh)
     return FmhaStaticTileSchedulerParams(is_persistent, problem_shape_mbh)
 
 class FmhaStaticTileScheduler:
@@ -197,15 +199,6 @@ class FmhaStaticTileScheduler:
         seqlen_q: Int32,
     ) -> Boolean:
         return current_idx * q_tiler < seqlen_q
-
-    @staticmethod
-    def check_valid_work_for_window_left(
-        k_tiler: int,
-        current_idx: Int32,
-        seqlen_k: Int32,
-        window_left: int,
-    ) -> Boolean:
-        return current_idx * k_tiler < seqlen_k + window_left
 
     def get_current_work(self, *, loc=None, ip=None) -> utils.WorkTileInfo:
         is_valid = (
@@ -281,6 +274,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         mma_tiler: Tuple[int, int, int],
         is_persistent: bool,
         mask_type: MaskType,
+        num_repeat_kv_heads: int = 1,
         logits_transform: Callable | None = None,
         output_transform: Callable | None = None,
         window_left: int = -1,
@@ -386,6 +380,9 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.output_transform = output_transform
         self.window_left = window_left
 
+        self.num_repeat_kv_heads = num_repeat_kv_heads
+
+
     def _setup_attributes(self):
         """Set up configurations and parameters for the FMHA kernel operation.
 
@@ -456,6 +453,9 @@ class BlackwellFusedMultiHeadAttentionForward:
         """
         b, s_q, s_k, h_q, h_k, d = problem_size
         h_r = h_q // h_k
+        cute.printf("h_r {}", h_r)
+        cute.printf("problem_size {}", problem_size)
+
         qo_offset = 0 if cum_seqlen_q is None else -s_q * d * h_r * h_k
         kv_offset = 0 if cum_seqlen_k is None else -s_k * d * h_k
         b_qo = b if cum_seqlen_q is None else s_q * (1 + b)
@@ -495,6 +495,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.v_dtype = v.element_type
         self.o_dtype = o.element_type
 
+        cute.printf("shape {}", (s_q, d, ((h_r, h_k), b)))
         self.tile_sched_params, grid = self._compute_grid(
             cute.shape((s_q, d, ((h_r, h_k), b))),
             self.cta_tiler,
@@ -886,7 +887,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         sK = storage.sK.get_tensor(
             k_smem_layout_staged.outer, swizzle=k_smem_layout_staged.inner
         )
-        cute.printf("sK {}", sK.shape)
+        # cute.printf("sK {}", sK.shape)
         # (MMA, MMA_K, MMA_D, PIPE)
         # Strip swizzle info to reuse smem
         sV_ptr = cute.recast_ptr(sK.iterator, v_smem_layout_staged.inner)
@@ -913,7 +914,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         tOtO0 = cute.make_tensor(tOtO.iterator + self.tmem_o0_offset, tOtO.layout)
         tOtO1 = cute.make_tensor(tOtO.iterator + self.tmem_o1_offset, tOtO.layout)
 
-        # cute.printf("tStS0 {}", tStS0.shape)
+        # cute.printf("tStS.layout {}", tStS.layout)
 
         tP = cute.make_tensor(tStS.iterator, p_tmem_layout_staged.outer)
         tOrP = pv_thr_mma.make_fragment_A(tP)[None, None, None, 0]
@@ -1737,7 +1738,9 @@ class BlackwellFusedMultiHeadAttentionForward:
         :return: Updated state values (row_max, row_sum, and pipeline related arguments)
         :rtype: tuple
         """
-        cS, row_max, row_sum, vec_i_handle = iter_args
+        cS, row_max, row_sum, vec_i_handle, batch_coord, head_coord = iter_args
+        qo_head_idx = head_coord
+        kv_head_idx = qo_head_idx // self.num_repeat_kv_heads
         seqlen_k, scale_softmax_log2 = value_args
         (
             mma_si_consumer,
@@ -1779,7 +1782,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         cute.copy(tiled_tmem_load, tTMEM_LOADtS, tTMEM_LOADrS)
         if need_apply_mask:
             self.apply_mask(tTMEM_LOADrS, tTMEM_LOADcS, seqlen_k)
-        print("tTMEM_LOADrS", tTMEM_LOADrS.shape)
+        # print("tTMEM_LOADrS", tTMEM_LOADrS.shape)
 
         old_row_max = row_max
         if cutlass.const_expr(not self.custom_logits_transform):
@@ -1793,7 +1796,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         tTMEM_STORE_VECrS = cute.make_fragment(
             tTMEM_STORE_VECcS.shape, self.qk_acc_dtype
         )
-        print("tTMEM_STORE_VECrS", tTMEM_STORE_VECrS.shape)
+        # print("tTMEM_STORE_VECrS", tTMEM_STORE_VECrS.shape)
         tTMEM_STORE_VECrS[0] = old_row_max
         tTMEM_STORE_VECrS[1] = row_max_safe
         cute.copy(tiled_tmem_store_vec, tTMEM_STORE_VECrS, tTMEM_STORE_VECtS)
@@ -1821,6 +1824,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         tTMEM_STORErS_x4_e_frg = cute.logical_divide(
             tTMEM_STORErS_x4_e, cute.make_layout(frg_tile)
         )
+        tTMEM_LOADcS_frg = cute.logical_divide(tTMEM_LOADcS, cute.make_layout(frg_tile))
         ### the softmax computation part ### e^(xi*scale - mi*scale)
         if cutlass.const_expr(not self.custom_logits_transform):
             for j in range(frg_cnt):
@@ -1840,7 +1844,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         else:
             for j in range(frg_cnt):
                 for k in range(cute.size(tTMEM_LOADrS_frg, mode=[0])):
-                    tTMEM_LOADrS_frg[k, j] = self.logits_transform(tTMEM_LOADrS_frg[k, j])
+                    qo_idx, kv_idx = tTMEM_LOADcS_frg[k, j]
+                    tTMEM_LOADrS_frg[k, j] = self.logits_transform(None, tTMEM_LOADrS_frg[k, j], batch_coord, qo_idx, kv_idx, qo_head_idx, kv_head_idx)
                 s_vec = tTMEM_LOADrS_frg[None, j].load()
                 tTMEM_STORErS_x4_e_frg[None, j].store(s_vec.to(self.q_dtype))
             
@@ -2054,16 +2059,21 @@ class BlackwellFusedMultiHeadAttentionForward:
                     + stage * self.qk_mma_tiler[0],
                     0,
                 )
+                # cute.printf("logical_offset {}", logical_offset)
                 cS = cute.domain_offset(logical_offset, cS_base)
+                # cute.printf("cS_base {}", cS_base.layout)
+                # cute.printf("cS[0,0] {}", cS[0,0])
                 vec_i_handle = si_corr_producer.acquire_and_advance()
                 unmask_count = self.get_unmasked_trip_count(
                     curr_block_coord,
                     self.cta_tiler,
                     seqlen_k_,
                 )
+                batch_coord = curr_block_coord[2][1]
+                head_coord = curr_block_coord[2][0]
                 for i in cutlass.range(0, unmask_count, 1, unroll=1):
                     cS_iter = cute.domain_offset((0, i * self.qk_mma_tiler[1]), cS)
-                    iter_args = (cS_iter, row_max, row_sum, vec_i_handle)
+                    iter_args = (cS_iter, row_max, row_sum, vec_i_handle, batch_coord, head_coord)
                     pipeline_args = (
                         mma_si_consumer,
                         si_corr_producer,
@@ -2087,7 +2097,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                         atom_args,
                         tensor_args,
                     )
-                cute.printf("cta tiler: {}", self.cta_tiler)
+                # cute.printf("cta tiler: {}", self.cta_tiler)
                 mask_count = self.get_masked_trip_count(
                     curr_block_coord,
                     self.cta_tiler,
@@ -2098,7 +2108,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                     unmask_count, unmask_count + mask_count, 1, unroll=1
                 ):
                     cS_iter = cute.domain_offset((0, i * self.qk_mma_tiler[1]), cS)
-                    iter_args = (cS_iter, row_max, row_sum, vec_i_handle)
+                    iter_args = (cS_iter, row_max, row_sum, vec_i_handle, batch_coord, head_coord)
                     pipeline_args = (
                         mma_si_consumer,
                         si_corr_producer,
@@ -2448,6 +2458,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         cta_tiler: Tuple[int, int, int],
         is_persistent: bool,
     ) -> Tuple[FmhaStaticTileSchedulerParams, Tuple[int, int, int]]:
+        cute.printf("o_shape {}", o_shape)
         tile_sched_params = create_fmha_static_tile_scheduler_params(
             is_persistent,
             (
@@ -2457,6 +2468,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             ),
         )
         grid = FmhaStaticTileScheduler.get_grid_shape(tile_sched_params)
+        cute.printf("grid: {}", grid)
         return tile_sched_params, grid
 
 def dumb_output_transform(x: cute.Tensor, scale: float) -> cute.Tensor:
@@ -2592,6 +2604,7 @@ class BatchPrefillCuteDSLWrapper:
             self._mma_tiler,
             self._is_persistent,
             self._mask_type,
+            h_r,
             logits_transform,
             output_transform,
             window_left,
@@ -2677,11 +2690,14 @@ class BatchPrefillCuteDSLWrapper:
         if out is None:
             out = torch.empty_like(q, device=q.device)
 
+        print(f"q.shape {q.shape}")
         # Convert tensors to cute format
         q_cute = from_dlpack(q, assumed_align=16)
         k_cute = from_dlpack(k, assumed_align=16)
         v_cute = from_dlpack(v, assumed_align=16)
         o_cute = from_dlpack(out, assumed_align=16)
+
+        # cute.printf("q_cute.shape {}", q_cute.shape)
 
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
