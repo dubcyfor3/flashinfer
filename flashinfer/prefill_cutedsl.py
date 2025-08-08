@@ -48,6 +48,7 @@ from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import Int32, Int64, Float32, Boolean
 
 from typing import Callable, Any
+from types import SimpleNamespace
 
 import warnings
 
@@ -278,6 +279,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         logits_transform: Callable | None = None,
         output_transform: Callable | None = None,
         window_left: int = -1,
+        M_D_update: Callable | None = None,
+        use_attention_sink: bool = False,
     ):
         """Initializes the configuration for a Blackwell Fused Multi-Head Attention (FMHA) kernel.
 
@@ -382,6 +385,12 @@ class BlackwellFusedMultiHeadAttentionForward:
 
         self.num_repeat_kv_heads = num_repeat_kv_heads
 
+        self.custom_M_D_update = True if M_D_update is not None else False
+        self.M_D_update = M_D_update
+        self.use_attention_sink = use_attention_sink
+        if use_attention_sink:
+            assert M_D_update is not None, "M_D_update is required when use_attention_sink is True"
+
 
     def _setup_attributes(self):
         """Set up configurations and parameters for the FMHA kernel operation.
@@ -413,6 +422,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         cum_seqlen_k: cute.Tensor | None,
         scale_softmax_log2: Float32,
         scale_output: Float32,
+        sink_iter: cute.Pointer | None,
         stream: cuda.CUstream,
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
@@ -446,6 +456,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         :type scale_softmax_log2: Float32
         :param scale_output: The scale factor for the output
         :type scale_output: Float32
+        :param sink_iter: The sink tensor pointer
+        :type sink_iter: cute.Pointer | None
         :param stream: The CUDA stream to execute the kernel on
         :type stream: cuda.CUstream
         :raises TypeError: If tensor data types don't match or aren't supported
@@ -466,7 +478,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         # (s, d, ((h_r, h_k), b))
         q_layout = cute.make_layout(
             (s_q, d, ((h_r, h_k), b_qo)),
-            stride=(d * h_r * h_k, 1, ((d * h_k, d), stride_b_qo)),
+            stride=(d * h_r * h_k, 1, ((d, d * h_r), stride_b_qo)),
         )
         q = cute.make_tensor(q_iter + qo_offset, q_layout)
         # (s, d, ((h_r, h_k), b)), 0-stride for h_r to broadcast
@@ -485,9 +497,13 @@ class BlackwellFusedMultiHeadAttentionForward:
         # (s, d, ((h_r, h_k), b))
         o_layout = cute.make_layout(
             (s_q, d, ((h_r, h_k), b_qo)),
-            stride=(d * h_r * h_k, 1, ((d * h_k, d), stride_b_qo)),
+            stride=(d * h_r * h_k, 1, ((d, d * h_r), stride_b_qo)),
         )
         o = cute.make_tensor(o_iter + qo_offset, o_layout)
+
+
+        sink = cute.make_tensor(sink_iter, cute.make_layout((h_q,))) if self.use_attention_sink else None
+        
 
         # setup static attributes before smem/grid/tma computation
         self.q_dtype = q.element_type
@@ -684,6 +700,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             cum_seqlen_k,
             scale_softmax_log2,
             scale_output,
+            sink,
             q_smem_layout_staged,
             k_smem_layout_staged,
             p_tmem_layout_staged,
@@ -717,6 +734,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         cum_seqlen_k: cute.Tensor | None,
         scale_softmax_log2: Float32,
         scale_output: Float32,
+        sink: cute.Tensor | None,
         q_smem_layout_staged: cute.ComposedLayout,
         k_smem_layout_staged: cute.ComposedLayout,
         p_tmem_layout_staged: cute.ComposedLayout,
@@ -761,6 +779,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         :type scale_softmax_log2: Float32
         :param scale_output: The scale factor for the output
         :type scale_output: Float32
+        :param sink: The sink tensor
+        :type sink: cute.Tensor | None
         :param q_smem_layout_staged: Shared memory layout for query tensor
         :type q_smem_layout_staged: cute.ComposedLayout
         :param k_smem_layout_staged: Shared memory layout for key tensor
@@ -1491,6 +1511,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                     qk_thr_mma=qk_thr_mma,
                     tStS=tStS,
                     tStSi=tStS0,
+                    sink=sink,
                     mma_si_consumer=mma_s0_consumer,
                     si_corr_producer=s0_corr_producer,
                     s0_s1_sequence_consumer=s0_s1_sequence_consumer,
@@ -1518,6 +1539,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                 qk_thr_mma=qk_thr_mma,
                 tStS=tStS,
                 tStSi=tStS1,
+                sink=sink,
                 mma_si_consumer=mma_s1_consumer,
                 si_corr_producer=s1_corr_producer,
                 s0_s1_sequence_consumer=s0_s1_sequence_consumer,
@@ -1652,12 +1674,10 @@ class BlackwellFusedMultiHeadAttentionForward:
                     # wait for o0
                     o0_handle = mma_corr_consumer.wait_and_advance()
                     o0_final_handle = corr_epi_producer.acquire_and_advance()
-                    # if cutlass.const_expr(not self.custom_logits_transform):
-                    #     epilogue_scale = scale_output / tTMEM_LOAD_VECrS[0]
-                    # else:
+
+                    epilogue_scale = scale_output
                     d = tTMEM_LOAD_VECrS[0] # row sum
                     m = tTMEM_LOAD_VECrS[1] # row max
-                    epilogue_scale = scale_output
                     self.correction_epilog(
                         pv_thr_mma,
                         tOtO0,
@@ -1680,14 +1700,16 @@ class BlackwellFusedMultiHeadAttentionForward:
                     # wait for o1
                     o1_handle = mma_corr_consumer.wait_and_advance()
                     o1_final_handle = corr_epi_producer.acquire_and_advance()
-                    if cutlass.const_expr(not self.custom_logits_transform):
-                        epilogue_scale = scale_output / tTMEM_LOAD_VECrS[0]
-                    else:
-                        epilogue_scale = scale_output
+
+                    epilogue_scale = scale_output
+                    d = tTMEM_LOAD_VECrS[0] # row sum
+                    m = tTMEM_LOAD_VECrS[1] # row max
                     self.correction_epilog(
                         pv_thr_mma,
                         tOtO1,
                         epilogue_scale,
+                        m,
+                        d,
                         sO[None, None, 1],
                         batch_coord,
                         head_coord,
@@ -1712,6 +1734,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         pipeline_args: tuple,
         atom_args: tuple,
         tensor_args: tuple,
+        sink: cute.Tensor | None,
     ) -> Tuple[
         Float32,
         Float32,
@@ -1756,6 +1779,9 @@ class BlackwellFusedMultiHeadAttentionForward:
         cS, row_max, row_sum, vec_i_handle, batch_coord, head_coord = iter_args
         qo_head_idx = head_coord
         kv_head_idx = qo_head_idx // self.num_repeat_kv_heads
+        kv_tile_idx = cS[0][1] // self.qk_mma_tiler[1]
+        # cute.printf("kv_tile_idx: {}", kv_tile_idx)
+
         seqlen_k, scale_softmax_log2 = value_args
         (
             mma_si_consumer,
@@ -1777,6 +1803,12 @@ class BlackwellFusedMultiHeadAttentionForward:
             tTMEM_STORE_VECtS,
             tTMEM_STOREtS_x4,
         ) = tensor_args
+
+        params = SimpleNamespace(
+            sink=sink,
+        )
+        if cutlass.const_expr(self.custom_M_D_update):
+            row_max, row_sum = self.M_D_update(params, kv_tile_idx, qo_head_idx, row_max, row_sum, scale_softmax_log2)
 
         tilePlikeFP32 = self.qk_mma_tiler[1] // Float32.width * self.o_dtype.width
         tScS = qk_thr_mma.partition_C(cS)
@@ -1903,7 +1935,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         local_row_sum_2 = cute.arch.add_packed_f32x2(local_row_sum_2, local_row_sum_3)
         local_row_sum_0 = cute.arch.add_packed_f32x2(local_row_sum_0, local_row_sum_2)
         row_sum = local_row_sum_0[0] + local_row_sum_0[1]
-        cute.printf("row_sum: {}", row_sum)
+        # cute.printf("row_sum: {}", row_sum)
 
         return (
             row_max,
@@ -1927,6 +1959,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         qk_thr_mma: cute.core.ThrMma,
         tStS: cute.Tensor,
         tStSi: cute.Tensor,
+        sink: cute.Tensor | None,
         mma_si_consumer: pipeline.PipelineConsumer,
         si_corr_producer: pipeline.PipelineProducer,
         s0_s1_sequence_consumer: pipeline.PipelineConsumer,
@@ -1962,6 +1995,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         :type s0_s1_sequence_pipeline: pipeline.PipelineAsync
         :param tile_sched_params: Parameters for tile scheduling
         :type tile_sched_params: FmhaStaticTileSchedulerParams
+        :param sink: The sink tensor
+        :type sink: cute.Tensor | None
         """
         tidx, _, _ = cute.arch.thread_idx()
         thread_idx = tidx % (
@@ -2105,6 +2140,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                         pipeline_args,
                         atom_args,
                         tensor_args,
+                        sink,
                     )
                 # cute.printf("cta tiler: {}", self.cta_tiler)
                 mask_count = self.get_masked_trip_count(
@@ -2140,6 +2176,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                         pipeline_args,
                         atom_args,
                         tensor_args,
+                        sink,
                     )
                 si_handle = mma_si_consumer.wait_and_advance()
                 tTMEM_STORE_VECrS = cute.make_fragment(
@@ -2283,28 +2320,23 @@ class BlackwellFusedMultiHeadAttentionForward:
         :param sO: Shared memory tensor for the final output
         :type sO: cute.Tensor
         """
-        if cutlass.const_expr(not self.custom_output_transform):
-            scale = scale / d
 
         pv_tiled_mma_shape = (
             self.pv_mma_tiler[0],
             self.pv_mma_tiler[1],
         )
         cO = cute.make_identity_tensor(pv_tiled_mma_shape)
-        if cutlass.const_expr(self.custom_output_transform):
-            cO_custom = cute.make_identity_tensor(pv_tiled_mma_shape)
+        cO_custom = cute.make_identity_tensor(pv_tiled_mma_shape)
 
         corr_tile_size = 32 * 8 // self.o_dtype.width
         tOsO = thr_mma.partition_C(sO)
         tOcO = thr_mma.partition_C(cO)
-        if cutlass.const_expr(self.custom_output_transform):
-            tOcO_custom = thr_mma.partition_C(cO_custom)
+        tOcO_custom = thr_mma.partition_C(cO_custom)
 
         tOtO_i = cute.logical_divide(tOtO, cute.make_layout((128, corr_tile_size)))
         tOcO_i = cute.logical_divide(tOcO, cute.make_layout((128, corr_tile_size)))
         tOsO_i = cute.logical_divide(tOsO, cute.make_layout((128, corr_tile_size)))
-        if cutlass.const_expr(self.custom_output_transform):
-            tOcO_custom_i = cute.logical_divide(tOcO_custom, cute.make_layout((128, corr_tile_size)))
+        tOcO_custom_i = cute.logical_divide(tOcO_custom, cute.make_layout((128, corr_tile_size)))
         tidx, _, _ = cute.arch.thread_idx()
         thread_idx = tidx % (self.threads_per_warp * len(self.correction_warp_ids))
 
@@ -2331,10 +2363,9 @@ class BlackwellFusedMultiHeadAttentionForward:
         tTMEM_LOADtO = thr_tmem_load.partition_S(tOtO_i[(None, None), None])
         tTMEM_LOADsO = thr_tmem_load.partition_D(tOsO_i[(None, None), None])
         tTMEM_LOADoO = thr_tmem_load.partition_D(tOcO_i[(None, None), None])
-        if cutlass.const_expr(self.custom_output_transform):
-            tTMEM_LOADcO_custom = thr_tmem_load.partition_D(tOcO_custom_i[(None, None), None])
+        tTMEM_LOADcO_custom = thr_tmem_load.partition_D(tOcO_custom_i[(None, None), None])
 
-
+        scale_rcp_d = scale / d
         for i in range(self.cta_tiler[2] // corr_tile_size):
             tTMEM_LOADtO_i = tTMEM_LOADtO[None, 0, 0, i]
             tTMEM_LOADsO_i = tTMEM_LOADsO[None, 0, 0, i]
@@ -2346,13 +2377,12 @@ class BlackwellFusedMultiHeadAttentionForward:
                 for j in range(0, cute.size(tTMrO), 2):
                     tTMrO[j], tTMrO[j + 1] = cute.arch.mul_packed_f32x2(
                         (tTMrO[j], tTMrO[j + 1]),
-                        (scale, scale),
+                        (scale_rcp_d, scale_rcp_d),
                     )
             else:
                 tTMcO_custom = tTMEM_LOADcO_custom[None, 0, 0, i]
                 for j in range(0, cute.size(tTMrO)):
                     qo_idx = qo_idx_offset + tTMcO_custom[j][0]
-                    print(f"qo_idx: {qo_idx}")
                     tTMrO[j] = self.output_transform(None, tTMrO[j], batch_coord, qo_idx, head_coord, m, d, scale)
             tSMrO = cute.make_fragment(tTMrO.shape, self.o_dtype)
             o_vec = tTMrO.load()
@@ -2540,6 +2570,8 @@ class BatchPrefillCuteDSLWrapper:
         logits_transform: Callable | None = None,
         output_transform: Callable | None = None,
         window_left: int = -1,
+        M_D_update: Callable | None = None,
+        use_attention_sink: bool = False,
     ) -> None:
 
         if not torch.cuda.is_available():
@@ -2557,6 +2589,8 @@ class BatchPrefillCuteDSLWrapper:
         self._is_persistent = True
 
         h_r = num_qo_heads // num_kv_heads
+
+        self._use_attention_sink = use_attention_sink
 
         
         # Set data types based on input parameters
@@ -2607,6 +2641,10 @@ class BatchPrefillCuteDSLWrapper:
         is_dynamic_layout=True,
     )
 
+        if use_attention_sink:
+            sink = torch.randn(num_qo_heads, dtype=torch.float16, device=self._device)
+            sink_cute = from_dlpack(sink, assumed_align=16)
+
         self._mma_tiler_mn = (128, 128)
         self._mma_tiler = (128, 128, self._head_dim)
         
@@ -2636,6 +2674,8 @@ class BatchPrefillCuteDSLWrapper:
             logits_transform,
             output_transform,
             window_left,
+            M_D_update,
+            use_attention_sink,
         )
 
         problem_size = (
@@ -2676,6 +2716,7 @@ class BatchPrefillCuteDSLWrapper:
             self._s_cumsum_k_cute_tensor,
             self._scale_softmax_log2,
             self._scale_output,
+            sink_cute.iterator if self._use_attention_sink else None,
             stream,
         )
 
@@ -2691,6 +2732,7 @@ class BatchPrefillCuteDSLWrapper:
         k: torch.Tensor,
         v: torch.Tensor,
         out: Optional[torch.Tensor] = None,
+        sink: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         r"""Run the prefill attention computation.
 
@@ -2704,7 +2746,8 @@ class BatchPrefillCuteDSLWrapper:
             The value tensor with shape [batch_size, seq_len, num_heads, head_dim].
         out : Optional[torch.Tensor], optional
             The output tensor. If None, a new tensor will be created.
-
+        sink : Optional[torch.Tensor], optional
+            The sink tensor with shape [num_heads].
         Returns
         -------
         torch.Tensor
@@ -2725,6 +2768,11 @@ class BatchPrefillCuteDSLWrapper:
         v_cute = from_dlpack(v, assumed_align=16)
         o_cute = from_dlpack(out, assumed_align=16)
 
+        if self._use_attention_sink:
+            assert sink is not None, "sink is required when use_attention_sink is True"
+            sink = sink.to(torch.float16)
+            sink_cute = from_dlpack(sink, assumed_align=16)
+
         # cute.printf("q_cute.shape {}", q_cute.shape)
 
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -2739,6 +2787,7 @@ class BatchPrefillCuteDSLWrapper:
             self._s_cumsum_k_cute_tensor,
             self._scale_softmax_log2,
             self._scale_output,
+            sink_cute.iterator if self._use_attention_sink else None,
             stream,
         )
 

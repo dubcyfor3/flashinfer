@@ -8,6 +8,8 @@ import flashinfer
 import flashinfer.triton
 from flashinfer.utils import is_sm100a_supported
 
+from sink_attention_reference import sink_softmax
+
 
 def attention_ref(
     batch_size,
@@ -16,6 +18,7 @@ def attention_ref(
     v: torch.Tensor,
     causal: bool,
     sm_scale: float,
+    sink: torch.Tensor | None = None,
 ) -> torch.Tensor:
     qo_len = q.shape[0] // batch_size
     kv_len = k.shape[0] // batch_size
@@ -50,7 +53,10 @@ def attention_ref(
 
     logits = logits.masked_fill(mask.unsqueeze(0).unsqueeze(0) == 0, float("-inf"))
     lse_ref = torch.logsumexp(logits, -1).transpose(-1, -2)
-    p = torch.softmax(logits, dim=-1)
+    if sink is not None:
+        p = sink_softmax(logits, sink)
+    else:
+        p = torch.softmax(logits, dim=-1)
     o_ref = (
         torch.einsum(
             "bhmn,bnhd->bmhd",
@@ -459,10 +465,10 @@ def test_blackwell_cutedsl_fmha(
     )
     o = wrapper.run(q, k, v)
     # special repeat order for cutedsl impl layout
-    k_repeat = k.repeat(1, num_qo_heads // num_kv_heads, 1)
-    v_repeat = v.repeat(1, num_qo_heads // num_kv_heads, 1)
+    # k_repeat = k.repeat(1, num_qo_heads // num_kv_heads, 1)
+    # v_repeat = v.repeat(1, num_qo_heads // num_kv_heads, 1)
     o_ref, lse_ref = attention_ref(
-        batch_size, q, k_repeat, v_repeat, causal, sm_scale
+        batch_size, q, k, v, causal, sm_scale
     )
 
     if dtype == torch.half:
@@ -580,7 +586,7 @@ def test_blackwell_cutedsl_fmha_output_transform(
 ):
 
     def dumb_output_transform(params, output, batch_idx, qo_idx, qo_head_idx, m, d, scale):
-        return output * scale * 2.0
+        return output * scale * 2.0 / d
 
     if qo_len > kv_len and causal:
         pytest.skip("qo_len > kv_len and causal is not supported")
@@ -640,6 +646,97 @@ def test_blackwell_cutedsl_fmha_output_transform(
 
     print("SUCCESS")
 
+@pytest.mark.parametrize("batch_size", [1, 2, 3, 9, 17])
+@pytest.mark.parametrize("qo_len", [1, 17, 177, 377, 977])
+@pytest.mark.parametrize("kv_len", [1, 17, 544, 977, 1999])
+@pytest.mark.parametrize("num_qo_heads", [32])
+@pytest.mark.parametrize("num_kv_heads", [8, 32])
+@pytest.mark.parametrize("head_dim_qk", [192, 128])
+@pytest.mark.parametrize("head_dim_vo", [128])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_blackwell_cutedsl_fmha_attention_sink(
+    batch_size,
+    qo_len,
+    kv_len,
+    num_qo_heads,
+    num_kv_heads,
+    head_dim_qk,
+    head_dim_vo,
+    causal,
+    dtype,
+):
+    import cutlass.cute as cute
+
+    @cute.jit
+    def sink_M_D_update(params, kv_tile_idx, qo_head_idx, m, d, scale):
+        log_sink = params.sink[qo_head_idx] * math.log2(math.exp(1.0)) if (kv_tile_idx == 0 and qo_head_idx < num_qo_heads) else -math.inf
+        m_new = log_sink if log_sink > m else m
+        scale = cute.arch.exp2(m - m_new)
+        d_new = cute.arch.exp2(log_sink - m_new) + d * scale
+        return m_new, d_new
+    
+    @cute.jit
+    def sink_output_transform(params, output, batch_idx, qo_idx, qo_head_idx, m, d, scale):
+        d_rcp = 1 / d if m != -math.inf else 0.0
+        return output * scale * d_rcp
+
+    if qo_len > kv_len and causal:
+        pytest.skip("qo_len > kv_len and causal is not supported")
+
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("SM100A is not supported on this device")
+    
+    torch.manual_seed(42)
+    q = torch.randn(
+        batch_size * qo_len, num_qo_heads, head_dim_qk, dtype=dtype, device="cuda"
+    )
+    qo_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * qo_len
+    )
+    k = torch.randn(
+        batch_size * kv_len, num_kv_heads, head_dim_qk, dtype=dtype, device="cuda"
+    )
+    v = torch.randn(
+        batch_size * kv_len, num_kv_heads, head_dim_vo, dtype=dtype, device="cuda"
+    )
+    kv_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * kv_len
+    )
+    sink = torch.randn((num_qo_heads,), dtype=dtype, device="cuda")
+
+    wrapper = flashinfer.BatchPrefillCuteDSLWrapper(
+        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+    )
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim_qk,
+        head_dim_vo=head_dim_vo,
+        causal=causal,
+        sm_scale=1.0,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+        output_transform=sink_output_transform,
+        M_D_update=sink_M_D_update,
+        use_attention_sink=True,
+    )
+    o = wrapper.run(q, k, v, sink=sink)
+    
+    # Use sigmoid-based attention reference instead of softmax
+    o_ref, _ = attention_ref(
+        batch_size, q, k, v, causal, 1.0, sink=sink
+    )
+
+    if dtype == torch.half:
+        torch.testing.assert_close(o, o_ref, rtol=1e-2, atol=1e-2)
+    else:
+        torch.testing.assert_close(o, o_ref, rtol=1e-2, atol=1e-2)
+
+    print("SUCCESS")
+
 
 if __name__ == "__main__":
     # test_blackwell_cutedsl_fmha(
@@ -654,18 +751,7 @@ if __name__ == "__main__":
     #     False,
     #     torch.float16,
     # )
-    test_blackwell_cutedsl_fmha_logits_transform(
-        4,
-        1024,
-        1024,
-        32,
-        32,
-        128,
-        128,
-        True,
-        torch.float16,
-    )
-    # test_blackwell_cutedsl_fmha_output_transform(
+    # test_blackwell_cutedsl_fmha_logits_transform(
     #     4,
     #     1024,
     #     1024,
@@ -676,6 +762,17 @@ if __name__ == "__main__":
     #     True,
     #     torch.float16,
     # )
+    test_blackwell_cutedsl_fmha_attention_sink(
+        4,
+        1024,
+        1024,
+        32,
+        8,
+        128,
+        128,
+        True,
+        torch.float16,
+    )
     # test_blackwell_cutlass_fmha(
     #     9,
     #     377,
