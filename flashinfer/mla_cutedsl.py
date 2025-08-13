@@ -2502,16 +2502,33 @@ class BlackwellMultiLatentAttentionForward:
                 cta_pv_tiler_mn,
                 (common_params.blk_coord[0], iter_n, common_params.blk_coord[2]),
             )
+            cO = cute.local_tile(
+                cute.make_identity_tensor(
+                    common_params.mAccO[
+                        None, common_params.blk_coord[3], None, None
+                    ].shape
+                ),
+                cta_pv_tiler_mn,
+                (common_params.blk_coord[0], iter_n, common_params.blk_coord[2]),
+            )
+
         else:
             gO = cute.local_tile(
                 common_params.mO,
                 cta_pv_tiler_mn,
                 (common_params.blk_coord[0], iter_n, common_params.blk_coord[2]),
             )
+            cO = cute.local_tile(
+                cute.make_identity_tensor(common_params.mO.shape),
+                cta_pv_tiler_mn,
+                (common_params.blk_coord[0], iter_n, common_params.blk_coord[2]),
+            )
+
         tTR_tAcc = tmem_load_thr_copy.partition_S(tAcc)
         tTR_gO = tmem_load_thr_copy.partition_D(gO)
+        tTR_cO = tmem_load_thr_copy.partition_D(cO)
         tTR_rAcc = cute.make_fragment_like(tTR_gO, self.acc_dtype)
-        return tmem_load_tiled_copy, tAcc, tTR_tAcc, tTR_gO, tTR_rAcc
+        return tmem_load_tiled_copy, tAcc, tTR_tAcc, tTR_gO, tTR_cO, tTR_rAcc
 
     @cute.jit
     def rescale(
@@ -2540,7 +2557,7 @@ class BlackwellMultiLatentAttentionForward:
 
         for iter_n in cutlass.range_constexpr(self.iterations_pv_n):
             # tmem load tiled copy and partition results.
-            tmem_load_tiled_copy, tAcc, tTR_tAcc, tTR_gO, tTR_rAcc = (
+            tmem_load_tiled_copy, tAcc, tTR_tAcc, tTR_gO, tTR_cO, tTR_rAcc = (
                 self._tmem_load_partition(
                     common_params, rescale_params.tiled_mma_pv, iter_n
                 )
@@ -2616,7 +2633,7 @@ class BlackwellMultiLatentAttentionForward:
 
         for iter_n in cutlass.range_constexpr(self.iterations_pv_n):
             # tmem load tiled copy and partition results.
-            tmem_load_tiled_copy, tAcc, tTR_tAcc, tTR_gO, tTR_rAcc = (
+            tmem_load_tiled_copy, tAcc, tTR_tAcc, tTR_gO, tTR_cO, tTR_rAcc = (
                 self._tmem_load_partition(
                     common_params, epilogue_params.tiled_mma_pv, iter_n
                 )
@@ -2642,7 +2659,8 @@ class BlackwellMultiLatentAttentionForward:
             else:
                 # using accumulate dtype for o
                 tR2G_rO_src = tTR_rAcc
-            cute.autovec_copy(tR2G_rO_src, tR2G_rO_dst)
+            if cute.elem_less(tTR_cO, self.num_heads):
+                cute.autovec_copy(tR2G_rO_src, tR2G_rO_dst)
 
             # store the lse to global memory
             cta_pv_tiler = (
@@ -2662,6 +2680,16 @@ class BlackwellMultiLatentAttentionForward:
                     ),
                     (1, None, 1),
                 )
+                cLSE = cute.local_tile(
+                    cute.make_identity_tensor(epilogue_params.mLSE.shape),
+                    (cta_pv_tiler[0], 1, 1),
+                    (
+                        common_params.blk_coord[0],
+                        common_params.blk_coord[1],
+                        common_params.blk_coord[2],
+                    ),
+                    (1, None, 1),
+                )
             else:
                 gLSE = cute.local_tile(
                     epilogue_params.mAccLSE[None, common_params.blk_coord[3], None],
@@ -2673,9 +2701,22 @@ class BlackwellMultiLatentAttentionForward:
                     ),
                     (1, None, 1),
                 )
+                cLSE = cute.local_tile(
+                    cute.make_identity_tensor(epilogue_params.mAccLSE[
+                            None, common_params.blk_coord[3], None
+                        ].shape
+                    ),
+                    (cta_pv_tiler[0], 1, 1),
+                    (
+                        common_params.blk_coord[0],
+                        common_params.blk_coord[1],
+                        common_params.blk_coord[2],
+                    ),
+                    (1, None, 1),
+                )
             lse = cute.arch.log2(row_sum) + epilogue_params.softmax_scale_log2 * row_max
             if cutlass.const_expr(self.warps_in_n == 2):
-                if common_params.tidx < 64:
+                if cute.elem_less(cLSE[common_params.tidx][0], self.num_heads):
                     gLSE[common_params.tidx] = lse
 
         cute.arch.fence_view_async_tmem_load()
