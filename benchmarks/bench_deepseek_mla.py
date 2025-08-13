@@ -18,6 +18,7 @@ import torch
 import triton
 import math
 import flashinfer
+import argparse
 from flashinfer.mla_cutedsl import BatchMLAPagedAttentionWrapperCuteDSL, BlackwellMultiLatentAttentionForward
 
 
@@ -266,19 +267,21 @@ def bench_deepseek_mla_decode_trtllm(batch_size, seq_len, num_heads):
 
 
 if __name__ == "__main__":
-    # for seq_len in [1024, 2048, 8192]:
-    #     for batch_size in [64, 128, 768]:
-    #         for num_heads in [128]:
-    #             bench_deepseek_mla_decode(batch_size, seq_len, num_heads, "auto")
+    parser = argparse.ArgumentParser(description="Benchmark DeepSeek MLA implementations")
+    parser.add_argument("--seq_len", type=int, default=2048, help="Sequence length for benchmarking")
+    parser.add_argument("--batch_size", type=int, default=128, help="Batch size for benchmarking")
+    parser.add_argument("--num_heads", type=int, default=128, help="Number of attention heads")
+    parser.add_argument("--benchmark", choices=["cutedsl", "trtllm", "all"], default="cutedsl", 
+                       help="Which benchmark to run")
     
-    print("\n=== CuteDSL Benchmark ===")
-    for seq_len in [1024, 2048, 8192]:
-        for batch_size in [64, 128, 768]:
-            for num_heads in [128]:
-                bench_deepseek_mla_decode_dsl(batch_size, seq_len, num_heads)
+    args = parser.parse_args()
     
-    print("\n=== TensorRT-LLM MLA Benchmark ===")
-    for seq_len in [1024, 2048, 8192]:
-        for batch_size in [64, 128, 768]:
-            for num_heads in [128]:
-                bench_deepseek_mla_decode_trtllm(batch_size, seq_len, num_heads)
+    print(f"Running benchmarks with: seq_len={args.seq_len}, batch_size={args.batch_size}, num_heads={args.num_heads}")
+    
+    if args.benchmark == "cutedsl" or args.benchmark == "all":
+        print("\n=== CuteDSL Benchmark ===")
+        bench_deepseek_mla_decode_dsl(args.batch_size, args.seq_len, args.num_heads)
+    
+    if args.benchmark == "trtllm" or args.benchmark == "all":
+        print("\n=== TensorRT-LLM MLA Benchmark ===")
+        bench_deepseek_mla_decode_trtllm(args.batch_size, args.seq_len, args.num_heads)

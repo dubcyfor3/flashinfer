@@ -2659,7 +2659,7 @@ class BlackwellMultiLatentAttentionForward:
             else:
                 # using accumulate dtype for o
                 tR2G_rO_src = tTR_rAcc
-            if cute.elem_less(tTR_cO, self.num_heads):
+            if cute.elem_less(tTR_cO[0][0], self.num_heads):
                 cute.autovec_copy(tR2G_rO_src, tR2G_rO_dst)
 
             # store the lse to global memory
@@ -3168,7 +3168,7 @@ class BatchMLAPagedAttentionWrapperCuteDSL:
     def __init__(
         self,
         float_workspace_buffer: torch.Tensor,
-        split_kv: int = -1,
+        split_kv: int = 1,
         use_cuda_graph: bool = False,
         qo_indptr: Optional[torch.Tensor] = None,
         kv_indptr: Optional[torch.Tensor] = None,
