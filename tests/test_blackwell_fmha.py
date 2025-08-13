@@ -464,15 +464,95 @@ def test_blackwell_cutedsl_fmha(
         kv_data_type=dtype,
     )
     o = wrapper.run(q, k, v)
-    # special repeat order for cutedsl impl layout
-    # k_repeat = k.repeat(1, num_qo_heads // num_kv_heads, 1)
-    # v_repeat = v.repeat(1, num_qo_heads // num_kv_heads, 1)
     o_ref, lse_ref = attention_ref(
         batch_size, q, k, v, causal, sm_scale
     )
 
     if dtype == torch.half:
         torch.testing.assert_close(o, o_ref, rtol=1e-2, atol=1e-2)
+    else:
+        torch.testing.assert_close(o, o_ref, rtol=1e-2, atol=1e-2)
+
+    print("SUCCESS")
+
+@pytest.mark.parametrize("indptr", VARLEN_INDPTR_PARAMS)
+@pytest.mark.parametrize("num_qo_heads", [32])
+@pytest.mark.parametrize("num_kv_heads", [8, 32])
+@pytest.mark.parametrize("head_dim_qk", [192, 128])
+@pytest.mark.parametrize("head_dim_vo", [128])
+@pytest.mark.parametrize("sm_scale", [1.0 / math.sqrt(128)])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_blackwell_cutedsl_fmha_varlen(
+    indptr,
+    num_qo_heads,
+    num_kv_heads,
+    head_dim_qk,
+    head_dim_vo,
+    sm_scale,
+    causal,
+    dtype,
+):
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("SM100A is not supported on this device")
+    
+    torch.manual_seed(42)
+    qkv = torch.randn(
+        indptr[-1],
+        (
+            num_qo_heads * head_dim_qk
+            + num_kv_heads * head_dim_qk
+            + num_kv_heads * head_dim_vo
+        ),
+        dtype=dtype,
+        device="cuda",
+    )
+    q = qkv[:, : num_qo_heads * head_dim_qk].view(indptr[-1], num_qo_heads, head_dim_qk)
+    k = qkv[
+        :,
+        num_qo_heads * head_dim_qk : num_qo_heads * head_dim_qk
+        + num_kv_heads * head_dim_qk,
+    ].view(indptr[-1], num_kv_heads, head_dim_qk)
+    v = qkv[:, num_qo_heads * head_dim_qk + num_kv_heads * head_dim_qk :].view(
+        indptr[-1], num_kv_heads, head_dim_vo
+    )
+    qo_indptr = torch.tensor(indptr, device="cuda", dtype=torch.int32)
+    kv_indptr = qo_indptr
+
+    s_q = qo_indptr[1:] - qo_indptr[:-1]
+
+    print(f"seq_len {s_q}")
+    print(f"qo_indptr {qo_indptr}")
+    max_s_q = torch.max(s_q)
+    print(f"max_s_q {max_s_q}")
+
+    wrapper = flashinfer.BatchPrefillCuteDSLWrapper(
+        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+    )
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim_qk,
+        head_dim_vo=head_dim_vo,
+        causal=causal,
+        sm_scale=sm_scale,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+    )
+    o = wrapper.run(q, k, v)
+
+    gqa_group_ratio = num_qo_heads // num_kv_heads
+    k_repeated = torch.repeat_interleave(k, gqa_group_ratio, dim=1)
+    v_repeated = torch.repeat_interleave(v, gqa_group_ratio, dim=1)
+
+    o_ref, lse_ref = attention_varlen_ref(
+        q, k_repeated, v_repeated, qo_indptr, kv_indptr, causal, sm_scale
+    )
+
+    if dtype == torch.half:
+        torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
     else:
         torch.testing.assert_close(o, o_ref, rtol=1e-2, atol=1e-2)
 
@@ -751,6 +831,16 @@ if __name__ == "__main__":
     #     False,
     #     torch.float16,
     # )
+    test_blackwell_cutedsl_fmha_varlen(
+        [0, 256, 1024, 2048, 2560],
+        32,
+        32,
+        128,
+        128,
+        1.0,
+        True,
+        torch.float16,
+    )
     # test_blackwell_cutedsl_fmha_logits_transform(
     #     4,
     #     1024,
@@ -762,17 +852,17 @@ if __name__ == "__main__":
     #     True,
     #     torch.float16,
     # )
-    test_blackwell_cutedsl_fmha_attention_sink(
-        4,
-        1024,
-        1024,
-        32,
-        8,
-        128,
-        128,
-        True,
-        torch.float16,
-    )
+    # test_blackwell_cutedsl_fmha_attention_sink(
+    #     4,
+    #     1024,
+    #     1024,
+    #     32,
+    #     8,
+    #     128,
+    #     128,
+    #     True,
+    #     torch.float16,
+    # )
     # test_blackwell_cutlass_fmha(
     #     9,
     #     377,

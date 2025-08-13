@@ -143,7 +143,7 @@ def create_fmha_static_tile_scheduler_params(
     is_persistent: bool,
     problem_shape_mbh: cute.Shape,
 ) -> FmhaStaticTileSchedulerParams:
-    cute.printf("problem_shape_mbh {}", problem_shape_mbh)
+    # cute.printf("problem_shape_mbh {}", problem_shape_mbh)
     return FmhaStaticTileSchedulerParams(is_persistent, problem_shape_mbh)
 
 class FmhaStaticTileScheduler:
@@ -465,8 +465,10 @@ class BlackwellFusedMultiHeadAttentionForward:
         """
         b, s_q, s_k, h_q, h_k, d = problem_size
         h_r = h_q // h_k
-        cute.printf("h_r {}", h_r)
-        cute.printf("problem_size {}", problem_size)
+        # cute.printf("h_r {}", h_r)
+        # cute.printf("problem_size {}", problem_size)
+
+        cute.printf("s_q, s_k, d * h_r * h_k {}", (s_q, s_k, d * h_r * h_k))
 
         qo_offset = 0 if cum_seqlen_q is None else -s_q * d * h_r * h_k
         kv_offset = 0 if cum_seqlen_k is None else -s_k * d * h_k
@@ -615,7 +617,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             qk_tiled_mma,
             self.cluster_layout_vmnk.shape,
         )
-
+        # cute.printf("tma_tensor_q.layout {}, tma_tensor_q.iterator {}", tma_tensor_q.layout, tma_tensor_q.iterator)
         # TMA load for K
         k_smem_layout = cute.select(k_smem_layout_staged, mode=[0, 1, 2])
         tma_atom_k, tma_tensor_k = cute.nvgpu.make_tiled_tma_atom_B(
@@ -977,6 +979,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                 continue_cond = False
                 cuseqlen_q = Int32(0)
                 seqlen_q = mQ_qdl.shape[0]
+                # cute.printf("mQ_qdl {}", mQ_qdl.layout)
                 if cutlass.const_expr(cum_seqlen_q is not None):
                     cuseqlen_q = cum_seqlen_q[batch_coord]
                     seqlen_q = cum_seqlen_q[batch_coord + 1] - cuseqlen_q
@@ -1002,6 +1005,8 @@ class BlackwellFusedMultiHeadAttentionForward:
                             (0, cuseqlen_q + seqlen_q),
                         )
                         mQ_qdl_ = cute.domain_offset(logical_offset_mQ, mQ_qdl)
+                        # cute.printf("mQ_qdl.layout {}, mQ_qdl_.layout {}", mQ_qdl.layout, mQ_qdl_.layout)
+                        # cute.printf("logical_offset_mQ {}, mQ_qdl[0,0,0] {}, mQ_qdl_[0,0,0] {}", logical_offset_mQ, mQ_qdl[0,0,0], mQ_qdl_[0,0,0])
                         curr_block_coord_q = (
                             curr_block_coord[0],
                             curr_block_coord[1],
@@ -1034,6 +1039,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                     gQ_qdl = cute.flat_divide(
                         mQ_qdl_, cute.select(self.qk_mma_tiler, mode=[0, 2])
                     )
+                    # cute.printf("gQ_qdl.layout {}, gQ_qdl[0] {}", gQ_qdl.layout, gQ_qdl[0])
                     tSgQ_qdl = qk_thr_mma.partition_A(gQ_qdl)
                     tQsQ, tQgQ_qdl = cute.nvgpu.cpasync.tma_partition(
                         tma_atom_q,
@@ -1043,6 +1049,8 @@ class BlackwellFusedMultiHeadAttentionForward:
                         cute.group_modes(tSgQ_qdl, 0, 3),
                     )
                     tQgQ = tQgQ_qdl[None, None, 0, curr_block_coord_q[2]]
+                    # cute.printf("tQgQ.layout {}, tQgQ[0] {}", tQgQ.layout, tQgQ[0])
+                    # cute.printf("tQsQ.layout {}, tQsQ[0] {}", tQsQ.layout, tQsQ[0])
 
                     gK_kdl = cute.flat_divide(
                         mK_kdl_, cute.select(self.qk_mma_tiler, mode=[1, 2])
@@ -1079,6 +1087,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                         tQsQ[None, q0_handle.index],
                         tma_bar_ptr=q0_handle.barrier,
                     )
+                    # cute.printf("tQsQ[0,q0_coord] {}, tQgQ[0,q0_handle.index] {}", tQsQ[0,q0_coord], tQgQ[0,q0_handle.index])
                     # K0
                     kv_coord = self.get_kv_start_block_idx(curr_block_coord, self.cta_tiler, seqlen_k)  # seqlen_kv_loop
 
@@ -2104,7 +2113,9 @@ class BlackwellFusedMultiHeadAttentionForward:
                     0,
                 )
                 # cute.printf("logical_offset {}", logical_offset)
+                # cute.printf("logical_offset {}, cS_base[0,0] {}", logical_offset, cS_base[0,0])
                 cS = cute.domain_offset(logical_offset, cS_base)
+                # cute.printf("logical_offset {}, cS_base[0,1] {}, cS[0,1] {}", logical_offset, cS_base[0,1], cS[0,1])
                 # cute.printf("cS_base {}", cS_base.layout)
                 # cute.printf("cS[0,0] {}", cS[0,0])
                 vec_i_handle = si_corr_producer.acquire_and_advance()
@@ -2365,7 +2376,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         tTMEM_LOADoO = thr_tmem_load.partition_D(tOcO_i[(None, None), None])
         tTMEM_LOADcO_custom = thr_tmem_load.partition_D(tOcO_custom_i[(None, None), None])
 
-        scale_rcp_d = scale / d
+
+        scale_rcp_d = scale / d if not self.custom_logits_transform else scale
         for i in range(self.cta_tiler[2] // corr_tile_size):
             tTMEM_LOADtO_i = tTMEM_LOADtO[None, 0, 0, i]
             tTMEM_LOADsO_i = tTMEM_LOADsO[None, 0, 0, i]
@@ -2629,6 +2641,9 @@ class BatchPrefillCuteDSLWrapper:
         kv_shape = (1, torch.sum(s_k), self._num_kv_heads, self._head_dim)
         kv_padding = (0, torch.max(s_k), 0, 0, 0)
 
+        self._qo_padding = qo_padding[1]
+        self._kv_padding = kv_padding[1]
+
         q_ref, q_cute, q_torch = create_and_pad_tensor(qo_shape, qo_padding, self._in_dtype, s_cumsum=s_cumsum_q_torch_tensor, is_dynamic_layout=True)
         k_ref, k_cute, k_torch = create_and_pad_tensor(kv_shape, kv_padding, self._in_dtype, s_cumsum=s_cumsum_k_torch_tensor, is_dynamic_layout=True)
         v_ref, v_cute, v_torch = create_and_pad_tensor(kv_shape, kv_padding, self._in_dtype, s_cumsum=s_cumsum_k_torch_tensor, is_dynamic_layout=True)
@@ -2761,12 +2776,11 @@ class BatchPrefillCuteDSLWrapper:
         if out is None:
             out = torch.empty_like(q, device=q.device)
 
-        print(f"q.shape {q.shape}")
         # Convert tensors to cute format
-        q_cute = from_dlpack(q, assumed_align=16)
-        k_cute = from_dlpack(k, assumed_align=16)
-        v_cute = from_dlpack(v, assumed_align=16)
-        o_cute = from_dlpack(out, assumed_align=16)
+        q_cute, q_torch = qkv_torch_2_cute(q, self._qo_padding, self._in_dtype)
+        k_cute, k_torch = qkv_torch_2_cute(k, self._kv_padding, self._in_dtype)
+        v_cute, v_torch = qkv_torch_2_cute(v, self._kv_padding, self._in_dtype)
+        o_cute, o_torch = qkv_torch_2_cute(out, self._qo_padding, self._out_dtype)
 
         if self._use_attention_sink:
             assert sink is not None, "sink is required when use_attention_sink is True"
@@ -2791,30 +2805,25 @@ class BatchPrefillCuteDSLWrapper:
             stream,
         )
 
-        return out
+        return o_torch
 
 def qkv_torch_2_cute(
-        x_torch, dtype, s_cumsum=None, is_dynamic_layout=True
+        x_torch, padding, dtype, s_cumsum=None, is_dynamic_layout=True
     ):
         # (b, s, h, d)
 
-        # Offset the tensor
-        
-        x_torch._keep_alive = x_torch
+        # pad tensor in front of the tensor on the second dimension
+        x_torch_full = torch.nn.functional.pad(x_torch, (0, 0, 0, 0, padding, 0))
+
+        x_torch = x_torch_full[padding:, :, :].detach()
+        x_torch._keep_alive = x_torch_full
 
         # Create dtype cute tensor with offset (gpu)
         x_cute = from_dlpack(x_torch, assumed_align=16)
         x_cute.element_type = dtype
-        # From ragged to jagged
-        if s_cumsum is not None:
-            x_torch = torch.nested.nested_tensor_from_jagged(
-                values=x_torch, offsets=s_cumsum
-            )
 
-        return (
-            x_cute,
-            x_torch,
-        )
+
+        return (x_cute, x_torch)
 
 def create_and_pad_tensor(
         shape, padding, dtype, s_cumsum=None, is_dynamic_layout=True
