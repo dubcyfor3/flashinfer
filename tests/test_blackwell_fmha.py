@@ -581,7 +581,7 @@ def test_blackwell_cutedsl_fmha_logits_transform(
 ):
 
     import cutlass.cute as cute
-    def sigmoid_logits_transform(params, x: cute.Tensor, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx) -> cute.Tensor:
+    def sigmoid_logits_transform(params, x, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx):
         scale = 1.0 * math.log2(math.exp(1.0))
         bias = 0.0
         return 1 / (1 + cute.arch.exp2(-(x * scale + bias)))
