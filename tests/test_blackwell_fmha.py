@@ -582,8 +582,8 @@ def test_blackwell_cutedsl_fmha_logits_transform(
 
     import cutlass.cute as cute
     def sigmoid_logits_transform(params, x, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx):
-        scale = 1.0 * math.log2(math.exp(1.0))
-        bias = 0.0
+        scale = params.scale
+        bias = params.bias
         return 1 / (1 + cute.arch.exp2(-(x * scale + bias)))
 
     if qo_len > kv_len and causal:
@@ -831,38 +831,38 @@ if __name__ == "__main__":
     #     False,
     #     torch.float16,
     # )
-    test_blackwell_cutedsl_fmha_varlen(
-        [0, 256, 1024, 2048, 2560],
+    # test_blackwell_cutedsl_fmha_varlen(
+    #     [0, 256, 1024, 2048, 2560],
+    #     32,
+    #     32,
+    #     128,
+    #     128,
+    #     1.0,
+    #     True,
+    #     torch.float16,
+    # )
+    test_blackwell_cutedsl_fmha_logits_transform(
+        4,
+        1024,
+        1024,
         32,
         32,
         128,
         128,
-        1.0,
         True,
-        torch.float16,
+        torch.bfloat16,
     )
-    # test_blackwell_cutedsl_fmha_logits_transform(
-    #     4,
-    #     1024,
-    #     1024,
-    #     32,
-    #     32,
-    #     128,
-    #     128,
-    #     True,
-    #     torch.float16,
-    # )
-    # test_blackwell_cutedsl_fmha_attention_sink(
-    #     4,
-    #     1024,
-    #     1024,
-    #     32,
-    #     8,
-    #     128,
-    #     128,
-    #     True,
-    #     torch.float16,
-    # )
+    test_blackwell_cutedsl_fmha_attention_sink(
+        4,
+        1024,
+        1024,
+        32,
+        8,
+        128,
+        128,
+        True,
+        torch.bfloat16,
+    )
     # test_blackwell_cutlass_fmha(
     #     9,
     #     377,

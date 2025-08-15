@@ -468,7 +468,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         # cute.printf("h_r {}", h_r)
         # cute.printf("problem_size {}", problem_size)
 
-        cute.printf("s_q, s_k, d * h_r * h_k {}", (s_q, s_k, d * h_r * h_k))
+        # cute.printf("s_q, s_k, d * h_r * h_k {}", (s_q, s_k, d * h_r * h_k))
 
         qo_offset = 0 if cum_seqlen_q is None else -s_q * d * h_r * h_k
         kv_offset = 0 if cum_seqlen_k is None else -s_k * d * h_k
@@ -513,7 +513,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.v_dtype = v.element_type
         self.o_dtype = o.element_type
 
-        cute.printf("shape {}", (s_q, d, ((h_r, h_k), b)))
+        # cute.printf("shape {}", (s_q, d, ((h_r, h_k), b)))
         self.tile_sched_params, grid = self._compute_grid(
             cute.shape((s_q, d, ((h_r, h_k), b))),
             self.cta_tiler,
@@ -576,7 +576,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             self.q_dtype,
             self.q_stage,
         )
-        print("q_smem_layout_staged", q_smem_layout_staged)
+        # print("q_smem_layout_staged", q_smem_layout_staged)
         k_smem_layout_staged = sm100_utils.make_smem_layout_b(
             qk_tiled_mma,
             self.qk_mma_tiler,
@@ -608,7 +608,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         tma_store_op = cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp()
 
         q_smem_layout = cute.select(q_smem_layout_staged, mode=[0, 1, 2])
-        print("q_smem_layout", q_smem_layout)
+        # print("q_smem_layout", q_smem_layout)
         tma_atom_q, tma_tensor_q = cute.nvgpu.make_tiled_tma_atom_A(
             tma_load_op,
             q,
@@ -1898,7 +1898,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             for j in range(frg_cnt):
                 for k in range(cute.size(tTMEM_LOADrS_frg, mode=[0])):
                     qo_idx, kv_idx = tTMEM_LOADcS_frg[k, j]
-                    tTMEM_LOADrS_frg[k, j] = self.logits_transform(None, tTMEM_LOADrS_frg[k, j], batch_coord, qo_idx, kv_idx, qo_head_idx, kv_head_idx)
+                    tTMEM_LOADrS_frg[k, j] = self.logits_transform(None, tTMEM_LOADrS_frg[k, j], batch_coord, qo_idx, kv_idx, qo_head_idx, kv_head_idx, scale, 0.0)
                 s_vec = tTMEM_LOADrS_frg[None, j].load()
                 tTMEM_STORErS_x4_e_frg[None, j].store(s_vec.to(self.q_dtype))
             
@@ -2378,6 +2378,7 @@ class BlackwellFusedMultiHeadAttentionForward:
 
 
         scale_rcp_d = scale / d if not self.custom_logits_transform else scale
+        rcp_d = 1 / d if m != -Float32.inf else 0.0
         for i in range(self.cta_tiler[2] // corr_tile_size):
             tTMEM_LOADtO_i = tTMEM_LOADtO[None, 0, 0, i]
             tTMEM_LOADsO_i = tTMEM_LOADsO[None, 0, 0, i]
@@ -2395,7 +2396,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                 tTMcO_custom = tTMEM_LOADcO_custom[None, 0, 0, i]
                 for j in range(0, cute.size(tTMrO)):
                     qo_idx = qo_idx_offset + tTMcO_custom[j][0]
-                    tTMrO[j] = self.output_transform(None, tTMrO[j], batch_coord, qo_idx, head_coord, m, d, scale)
+                    tTMrO[j] = self.output_transform(None, tTMrO[j], batch_coord, qo_idx, head_coord, m, rcp_d, scale)
             tSMrO = cute.make_fragment(tTMrO.shape, self.o_dtype)
             o_vec = tTMrO.load()
             tSMrO.store(o_vec.to(self.o_dtype))
@@ -2528,7 +2529,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         cta_tiler: Tuple[int, int, int],
         is_persistent: bool,
     ) -> Tuple[FmhaStaticTileSchedulerParams, Tuple[int, int, int]]:
-        cute.printf("o_shape {}", o_shape)
+        # cute.printf("o_shape {}", o_shape)
         tile_sched_params = create_fmha_static_tile_scheduler_params(
             is_persistent,
             (
@@ -2538,7 +2539,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             ),
         )
         grid = FmhaStaticTileScheduler.get_grid_shape(tile_sched_params)
-        cute.printf("grid: {}", grid)
+        # cute.printf("grid: {}", grid)
         return tile_sched_params, grid
 
 def dumb_output_transform(x: cute.Tensor, scale: float) -> cute.Tensor:
