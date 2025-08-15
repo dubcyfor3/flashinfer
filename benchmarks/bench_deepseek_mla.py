@@ -79,7 +79,7 @@ def bench_deepseek_mla_decode(batch_size, seq_len, num_heads, backend):
     print(f"Memory bandwidth: {io * 1e-6 / ms:.2f} GB/s")
     print(f"FLOPs: {flops * 1e-9 / ms:.2f} TFLOPs")
 
-def bench_deepseek_mla_decode_dsl(batch_size, seq_len, num_heads):
+def bench_deepseek_mla_decode_cutedsl(batch_size, seq_len, num_heads):
     head_dim_ckv = 512
     head_dim_kpe = 64
     page_size = 128
@@ -267,21 +267,13 @@ def bench_deepseek_mla_decode_trtllm(batch_size, seq_len, num_heads):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Benchmark DeepSeek MLA implementations")
-    parser.add_argument("--seq_len", type=int, default=2048, help="Sequence length for benchmarking")
-    parser.add_argument("--batch_size", type=int, default=128, help="Batch size for benchmarking")
-    parser.add_argument("--num_heads", type=int, default=128, help="Number of attention heads")
-    parser.add_argument("--benchmark", choices=["cutedsl", "trtllm", "all"], default="cutedsl", 
-                       help="Which benchmark to run")
     
-    args = parser.parse_args()
+    batch_size = 128
+    seq_len = 2048
+    num_heads = 128
+
+    print("\n=== CuteDSL Benchmark ===")
+    bench_deepseek_mla_decode_cutedsl(batch_size, seq_len, num_heads)
     
-    print(f"Running benchmarks with: seq_len={args.seq_len}, batch_size={args.batch_size}, num_heads={args.num_heads}")
-    
-    if args.benchmark == "cutedsl" or args.benchmark == "all":
-        print("\n=== CuteDSL Benchmark ===")
-        bench_deepseek_mla_decode_dsl(args.batch_size, args.seq_len, args.num_heads)
-    
-    if args.benchmark == "trtllm" or args.benchmark == "all":
-        print("\n=== TensorRT-LLM MLA Benchmark ===")
-        bench_deepseek_mla_decode_trtllm(args.batch_size, args.seq_len, args.num_heads)
+    print("\n=== TensorRT-LLM MLA Benchmark ===")
+    bench_deepseek_mla_decode_trtllm(batch_size, seq_len, num_heads)
