@@ -276,6 +276,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         is_persistent: bool,
         mask_type: MaskType,
         num_repeat_kv_heads: int = 1,
+        custom_params: Any | None = None,
         logits_transform: Callable | None = None,
         output_transform: Callable | None = None,
         window_left: int = -1,
@@ -385,6 +386,7 @@ class BlackwellFusedMultiHeadAttentionForward:
 
         self.num_repeat_kv_heads = num_repeat_kv_heads
 
+        self.custom_params = custom_params
         self.custom_M_D_update = True if M_D_update is not None else False
         self.M_D_update = M_D_update
         self.use_attention_sink = use_attention_sink
@@ -1813,11 +1815,9 @@ class BlackwellFusedMultiHeadAttentionForward:
             tTMEM_STOREtS_x4,
         ) = tensor_args
 
-        params = SimpleNamespace(
-            sink=sink,
-        )
+        self.custom_params.sink = sink
         if cutlass.const_expr(self.custom_M_D_update):
-            row_max, row_sum = self.M_D_update(params, kv_tile_idx, qo_head_idx, row_max, row_sum, scale_softmax_log2)
+            row_max, row_sum = self.M_D_update(self.custom_params, kv_tile_idx, qo_head_idx, row_max, row_sum, scale_softmax_log2)
 
         tilePlikeFP32 = self.qk_mma_tiler[1] // Float32.width * self.o_dtype.width
         tScS = qk_thr_mma.partition_C(cS)
@@ -1898,7 +1898,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             for j in range(frg_cnt):
                 for k in range(cute.size(tTMEM_LOADrS_frg, mode=[0])):
                     qo_idx, kv_idx = tTMEM_LOADcS_frg[k, j]
-                    tTMEM_LOADrS_frg[k, j] = self.logits_transform(None, tTMEM_LOADrS_frg[k, j], batch_coord, qo_idx, kv_idx, qo_head_idx, kv_head_idx, scale, 0.0)
+                    tTMEM_LOADrS_frg[k, j] = self.logits_transform(self.custom_params, tTMEM_LOADrS_frg[k, j], batch_coord, qo_idx, kv_idx, qo_head_idx, kv_head_idx)
                 s_vec = tTMEM_LOADrS_frg[None, j].load()
                 tTMEM_STORErS_x4_e_frg[None, j].store(s_vec.to(self.q_dtype))
             
@@ -2396,7 +2396,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                 tTMcO_custom = tTMEM_LOADcO_custom[None, 0, 0, i]
                 for j in range(0, cute.size(tTMrO)):
                     qo_idx = qo_idx_offset + tTMcO_custom[j][0]
-                    tTMrO[j] = self.output_transform(None, tTMrO[j], batch_coord, qo_idx, head_coord, m, rcp_d, scale)
+                    tTMrO[j] = self.output_transform(self.custom_params, tTMrO[j], batch_coord, qo_idx, head_coord, m, rcp_d, scale)
             tSMrO = cute.make_fragment(tTMrO.shape, self.o_dtype)
             o_vec = tTMrO.load()
             tSMrO.store(o_vec.to(self.o_dtype))

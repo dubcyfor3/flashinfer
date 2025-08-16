@@ -9,6 +9,7 @@ import flashinfer.triton
 from flashinfer.utils import is_sm100a_supported
 
 from sink_attention_reference import sink_softmax
+from types import SimpleNamespace
 
 
 def attention_ref(
@@ -581,10 +582,15 @@ def test_blackwell_cutedsl_fmha_logits_transform(
 ):
 
     import cutlass.cute as cute
+    params = SimpleNamespace(
+        scale=1.0 * math.log2(math.exp(1.0)),
+        bias=0.0,
+    )
+    @cute.jit
     def sigmoid_logits_transform(params, x, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx):
         scale = params.scale
         bias = params.bias
-        return 1 / (1 + cute.arch.exp2(-(x * scale + bias)))
+        return cute.arch.rcp_approx(1 + cute.arch.exp2(-(x * scale + bias)))
 
     if qo_len > kv_len and causal:
         pytest.skip("qo_len > kv_len and causal is not supported")
@@ -623,6 +629,7 @@ def test_blackwell_cutedsl_fmha_logits_transform(
         sm_scale=1.0,
         q_data_type=dtype,
         kv_data_type=dtype,
+        custom_params=params,
         logits_transform=sigmoid_logits_transform,
     )
     o = wrapper.run(q, k, v)
@@ -665,8 +672,9 @@ def test_blackwell_cutedsl_fmha_output_transform(
     dtype,
 ):
 
-    def dumb_output_transform(params, output, batch_idx, qo_idx, qo_head_idx, m, d, scale):
-        return output * scale * 2.0 / d
+    @cute.jit
+    def dumb_output_transform(params, output, batch_idx, qo_idx, qo_head_idx, m, rcp_d, scale):
+        return output * scale * 2.0 * rcp_d
 
     if qo_len > kv_len and causal:
         pytest.skip("qo_len > kv_len and causal is not supported")
@@ -757,9 +765,8 @@ def test_blackwell_cutedsl_fmha_attention_sink(
         return m_new, d_new
     
     @cute.jit
-    def sink_output_transform(params, output, batch_idx, qo_idx, qo_head_idx, m, d, scale):
-        d_rcp = 1 / d if m != -math.inf else 0.0
-        return output * scale * d_rcp
+    def sink_output_transform(params, output, batch_idx, qo_idx, qo_head_idx, m, rcp_d, scale):
+        return output * scale * rcp_d
 
     if qo_len > kv_len and causal:
         pytest.skip("qo_len > kv_len and causal is not supported")
@@ -819,18 +826,18 @@ def test_blackwell_cutedsl_fmha_attention_sink(
 
 
 if __name__ == "__main__":
-    # test_blackwell_cutedsl_fmha(
-    #     4,
-    #     1024,
-    #     1024,
-    #     32,
-    #     8,
-    #     128,
-    #     128,
-    #     1,
-    #     False,
-    #     torch.float16,
-    # )
+    test_blackwell_cutedsl_fmha(
+        4,
+        1024,
+        1024,
+        32,
+        8,
+        128,
+        128,
+        1,
+        False,
+        torch.float16,
+    )
     # test_blackwell_cutedsl_fmha_varlen(
     #     [0, 256, 1024, 2048, 2560],
     #     32,
@@ -841,28 +848,28 @@ if __name__ == "__main__":
     #     True,
     #     torch.float16,
     # )
-    test_blackwell_cutedsl_fmha_logits_transform(
-        4,
-        1024,
-        1024,
-        32,
-        32,
-        128,
-        128,
-        True,
-        torch.bfloat16,
-    )
-    test_blackwell_cutedsl_fmha_attention_sink(
-        4,
-        1024,
-        1024,
-        32,
-        8,
-        128,
-        128,
-        True,
-        torch.bfloat16,
-    )
+    # test_blackwell_cutedsl_fmha_logits_transform(
+    #     4,
+    #     1024,
+    #     1024,
+    #     32,
+    #     32,
+    #     128,
+    #     128,
+    #     True,
+    #     torch.bfloat16,
+    # )
+    # test_blackwell_cutedsl_fmha_attention_sink(
+    #     4,
+    #     1024,
+    #     1024,
+    #     32,
+    #     8,
+    #     128,
+    #     128,
+    #     True,
+    #     torch.bfloat16,
+    # )
     # test_blackwell_cutlass_fmha(
     #     9,
     #     377,
