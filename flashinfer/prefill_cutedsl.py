@@ -386,7 +386,7 @@ class BlackwellFusedMultiHeadAttentionForward:
 
         self.num_repeat_kv_heads = num_repeat_kv_heads
 
-        self.custom_params = custom_params
+        self.custom_params = custom_params if custom_params is not None else SimpleNamespace()
         self.custom_M_D_update = True if M_D_update is not None else False
         self.M_D_update = M_D_update
         self.use_attention_sink = use_attention_sink
@@ -1815,8 +1815,8 @@ class BlackwellFusedMultiHeadAttentionForward:
             tTMEM_STOREtS_x4,
         ) = tensor_args
 
-        self.custom_params.sink = sink
         if cutlass.const_expr(self.custom_M_D_update):
+            self.custom_params.sink = sink
             row_max, row_sum = self.M_D_update(self.custom_params, kv_tile_idx, qo_head_idx, row_max, row_sum, scale_softmax_log2)
 
         tilePlikeFP32 = self.qk_mma_tiler[1] // Float32.width * self.o_dtype.width
@@ -2580,6 +2580,7 @@ class BatchPrefillCuteDSLWrapper:
         sm_scale=1.0,
         q_data_type=torch.float16,
         kv_data_type=torch.float16,
+        custom_params: SimpleNamespace | None = None,
         logits_transform: Callable | None = None,
         output_transform: Callable | None = None,
         window_left: int = -1,
@@ -2687,6 +2688,7 @@ class BatchPrefillCuteDSLWrapper:
             self._is_persistent,
             self._mask_type,
             h_r,
+            custom_params,
             logits_transform,
             output_transform,
             window_left,

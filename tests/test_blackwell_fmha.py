@@ -10,6 +10,7 @@ from flashinfer.utils import is_sm100a_supported
 
 from sink_attention_reference import sink_softmax
 from types import SimpleNamespace
+import cutlass.cute as cute
 
 
 def attention_ref(
@@ -581,7 +582,6 @@ def test_blackwell_cutedsl_fmha_logits_transform(
     dtype,
 ):
 
-    import cutlass.cute as cute
     params = SimpleNamespace(
         scale=1.0 * math.log2(math.exp(1.0)),
         bias=0.0,
@@ -648,7 +648,7 @@ def test_blackwell_cutedsl_fmha_logits_transform(
     else:
         torch.testing.assert_close(o, o_ref, rtol=1e-2, atol=1e-2)
 
-    print("SUCCESS")
+    print("LOGITS SUCCESS")
 
 
 @pytest.mark.parametrize("batch_size", [1, 2, 3, 9, 17])
@@ -826,18 +826,18 @@ def test_blackwell_cutedsl_fmha_attention_sink(
 
 
 if __name__ == "__main__":
-    test_blackwell_cutedsl_fmha(
-        4,
-        1024,
-        1024,
-        32,
-        8,
-        128,
-        128,
-        1,
-        False,
-        torch.float16,
-    )
+    # test_blackwell_cutedsl_fmha(
+    #     4,
+    #     1024,
+    #     1024,
+    #     32,
+    #     8,
+    #     128,
+    #     128,
+    #     1,
+    #     False,
+    #     torch.float16,
+    # )
     # test_blackwell_cutedsl_fmha_varlen(
     #     [0, 256, 1024, 2048, 2560],
     #     32,
@@ -848,17 +848,17 @@ if __name__ == "__main__":
     #     True,
     #     torch.float16,
     # )
-    # test_blackwell_cutedsl_fmha_logits_transform(
-    #     4,
-    #     1024,
-    #     1024,
-    #     32,
-    #     32,
-    #     128,
-    #     128,
-    #     True,
-    #     torch.bfloat16,
-    # )
+    test_blackwell_cutedsl_fmha_output_transform(
+        4,
+        1024,
+        1024,
+        32,
+        32,
+        128,
+        128,
+        True,
+        torch.float16,
+    )
     # test_blackwell_cutedsl_fmha_attention_sink(
     #     4,
     #     1024,
@@ -868,7 +868,7 @@ if __name__ == "__main__":
     #     128,
     #     128,
     #     True,
-    #     torch.bfloat16,
+    #     torch.float16,
     # )
     # test_blackwell_cutlass_fmha(
     #     9,
