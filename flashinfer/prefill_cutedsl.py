@@ -2020,6 +2020,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         cS_base = cute.make_identity_tensor(
             (self.qk_mma_tiler[0], self.qk_mma_tiler[1])
         )
+        # cute.print_tensor(cS_base)
         tilePlikeFP32 = self.qk_mma_tiler[1] // 32 * self.o_dtype.width
         tScS = qk_thr_mma.partition_C(cS_base)
         tStS_vec_layout = cute.composition(tStS.layout, cute.make_layout((128, 2)))
@@ -2113,7 +2114,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                     0,
                 )
                 # cute.printf("logical_offset {}", logical_offset)
-                # cute.printf("logical_offset {}, cS_base[0,0] {}", logical_offset, cS_base[0,0])
+                # cute.printf("logical_offset {}, cS_base.layout {}", logical_offset, cS_base.layout)
                 cS = cute.domain_offset(logical_offset, cS_base)
                 # cute.printf("logical_offset {}, cS_base[0,1] {}, cS[0,1] {}", logical_offset, cS_base[0,1], cS[0,1])
                 # cute.printf("cS_base {}", cS_base.layout)
