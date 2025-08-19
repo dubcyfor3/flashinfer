@@ -499,37 +499,16 @@ def test_blackwell_cutedsl_fmha_varlen(
         pytest.skip("SM100A is not supported on this device")
     
     torch.manual_seed(42)
-    qkv = torch.randn(
-        indptr[-1],
-        (
-            num_qo_heads * head_dim_qk
-            + num_kv_heads * head_dim_qk
-            + num_kv_heads * head_dim_vo
-        ),
-        dtype=dtype,
-        device="cuda",
-    )
-    q = qkv[:, : num_qo_heads * head_dim_qk].view(indptr[-1], num_qo_heads, head_dim_qk)
-    k = qkv[
-        :,
-        num_qo_heads * head_dim_qk : num_qo_heads * head_dim_qk
-        + num_kv_heads * head_dim_qk,
-    ].view(indptr[-1], num_kv_heads, head_dim_qk)
-    v = qkv[:, num_qo_heads * head_dim_qk + num_kv_heads * head_dim_qk :].view(
-        indptr[-1], num_kv_heads, head_dim_vo
-    )
+
+    q = torch.randn(indptr[-1], num_qo_heads, head_dim_qk, dtype=dtype, device="cuda")
+    k = torch.randn(indptr[-1], num_kv_heads, head_dim_qk, dtype=dtype, device="cuda")
+    v = torch.randn(indptr[-1], num_kv_heads, head_dim_vo, dtype=dtype, device="cuda")
+
     qo_indptr = torch.tensor(indptr, device="cuda", dtype=torch.int32)
     kv_indptr = qo_indptr
 
-    s_q = qo_indptr[1:] - qo_indptr[:-1]
-
-    print(f"seq_len {s_q}")
-    print(f"qo_indptr {qo_indptr}")
-    max_s_q = torch.max(s_q)
-    print(f"max_s_q {max_s_q}")
-
     wrapper = flashinfer.BatchPrefillCuteDSLWrapper(
-        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+        torch.empty(1, device="cuda", dtype=torch.uint8),
     )
     wrapper.plan(
         qo_indptr,
@@ -832,16 +811,16 @@ if __name__ == "__main__":
     #     False,
     #     torch.float16,
     # )
-    test_blackwell_cutedsl_fmha_varlen(
-        [0, 256, 1024, 2048, 2560],
-        32,
-        32,
-        128,
-        128,
-        1.0,
-        True,
-        torch.float16,
-    )
+    # test_blackwell_cutedsl_fmha_varlen(
+    #     [0, 256, 1024, 2048, 2560],
+    #     32,
+    #     32,
+    #     128,
+    #     128,
+    #     1.0,
+    #     True,
+    #     torch.bfloat16,
+    # )
     # test_blackwell_cutedsl_fmha_output_transform(
     #     4,
     #     1024,
@@ -853,17 +832,17 @@ if __name__ == "__main__":
     #     True,
     #     torch.float16,
     # )
-    # test_blackwell_cutedsl_fmha_attention_sink(
-    #     4,
-    #     1024,
-    #     1024,
-    #     32,
-    #     8,
-    #     128,
-    #     128,
-    #     True,
-    #     torch.float16,
-    # )
+    test_blackwell_cutedsl_fmha_attention_sink(
+        4,
+        1024,
+        1024,
+        32,
+        8,
+        128,
+        128,
+        True,
+        torch.float16,
+    )
     # test_blackwell_cutlass_fmha(
     #     9,
     #     377,

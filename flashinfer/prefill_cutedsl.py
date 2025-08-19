@@ -421,7 +421,9 @@ class BlackwellFusedMultiHeadAttentionForward:
         o_iter: cute.Pointer,
         problem_size: Tuple[Int32, Int32, Int32, Int32, Int32, Int32],
         cum_seqlen_q: cute.Tensor | None,
+        s_q_all: Int32,
         cum_seqlen_k: cute.Tensor | None,
+        s_k_all: Int32,
         scale_softmax_log2: Float32,
         scale_output: Float32,
         sink_iter: cute.Pointer | None,
@@ -467,44 +469,42 @@ class BlackwellFusedMultiHeadAttentionForward:
         """
         b, s_q, s_k, h_q, h_k, d = problem_size
         h_r = h_q // h_k
-        # cute.printf("h_r {}", h_r)
-        # cute.printf("problem_size {}", problem_size)
 
-        # cute.printf("s_q, s_k, d * h_r * h_k {}", (s_q, s_k, d * h_r * h_k))
-
-        qo_offset = 0 if cum_seqlen_q is None else -s_q * d * h_r * h_k
-        kv_offset = 0 if cum_seqlen_k is None else -s_k * d * h_k
-        b_qo = b if cum_seqlen_q is None else s_q * (1 + b)
-        b_kv = b if cum_seqlen_k is None else s_k * (1 + b)
-        stride_b_qo = h_r * h_k * s_q * d if cum_seqlen_q is None else d * h_r * h_k
-        stride_b_kv = h_k * s_k * d if cum_seqlen_k is None else d * h_k
+        q_offset = 0
+        kv_offset = 0
+        o_offset = -s_q * d * h_r * h_k
+        b_q = 1
+        b_kv = 1
+        b_o = s_q * (1 + b)
+        stride_b_q = 0
+        stride_b_kv = 0
+        stride_b_o = d * h_r * h_k
 
         # (s, d, ((h_r, h_k), b))
         q_layout = cute.make_layout(
-            (s_q, d, ((h_r, h_k), b_qo)),
-            stride=(d * h_r * h_k, 1, ((d, d * h_r), stride_b_qo)),
+            (s_q_all, d, ((h_r, h_k), b_q)),
+            stride=(d * h_r * h_k, 1, ((d, d * h_r), stride_b_q)),
         )
-        q = cute.make_tensor(q_iter + qo_offset, q_layout)
+        q = cute.make_tensor(q_iter + q_offset, q_layout)
         # (s, d, ((h_r, h_k), b)), 0-stride for h_r to broadcast
         k_layout = cute.make_layout(
-            (s_k, d, ((h_r, h_k), b_kv)),
+            (s_k_all, d, ((h_r, h_k), b_kv)),
             stride=(d * h_k, 1, ((0, d), stride_b_kv)),
         )
         k = cute.make_tensor(k_iter + kv_offset, k_layout)
         # cute.printf("k {}", k.shape)
         # (d, s, ((h_r, h_k), b)), 0-stride for h_r to broadcast
         v_layout = cute.make_layout(
-            (d, s_k, ((h_r, h_k), b_kv)),
+            (d, s_k_all, ((h_r, h_k), b_kv)),
             stride=(1, d * h_k, ((0, d), stride_b_kv)),
         )
         v = cute.make_tensor(v_iter + kv_offset, v_layout)
         # (s, d, ((h_r, h_k), b))
         o_layout = cute.make_layout(
-            (s_q, d, ((h_r, h_k), b_qo)),
-            stride=(d * h_r * h_k, 1, ((d, d * h_r), stride_b_qo)),
+            (s_q, d, ((h_r, h_k), b_o)),
+            stride=(d * h_r * h_k, 1, ((d, d * h_r), stride_b_o)),
         )
-        o = cute.make_tensor(o_iter + qo_offset, o_layout)
-
+        o = cute.make_tensor(o_iter + o_offset, o_layout)
 
         sink = cute.make_tensor(sink_iter, cute.make_layout((h_q,))) if self.use_attention_sink else None
         
@@ -1002,9 +1002,9 @@ class BlackwellFusedMultiHeadAttentionForward:
 
                     if cutlass.const_expr(cum_seqlen_q is not None):
                         logical_offset_mQ = (
-                            mQ_qdl.shape[0] - seqlen_q,
+                            cuseqlen_q,
                             0,
-                            (0, cuseqlen_q + seqlen_q),
+                            (0, 0),
                         )
                         mQ_qdl_ = cute.domain_offset(logical_offset_mQ, mQ_qdl)
                         # cute.printf("mQ_qdl.layout {}, mQ_qdl_.layout {}", mQ_qdl.layout, mQ_qdl_.layout)
@@ -1019,14 +1019,14 @@ class BlackwellFusedMultiHeadAttentionForward:
                         cuseqlen_k = cum_seqlen_k[batch_coord]
                         seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
                         logical_offset_mK = (
-                            mK_kdl.shape[0] - seqlen_k,
+                            cuseqlen_k,
                             0,
-                            (0, cuseqlen_k + seqlen_k),
+                            (0, 0),
                         )
                         logical_offset_mV = (
                             0,
-                            mK_kdl.shape[0] - seqlen_k,
-                            (0, cuseqlen_k + seqlen_k),
+                            cuseqlen_k,
+                            (0, 0),
                         )
                         mK_kdl_ = cute.domain_offset(logical_offset_mK, mK_kdl)
                         mV_dkl_ = cute.domain_offset(logical_offset_mV, mV_dkl)
@@ -2640,20 +2640,19 @@ class BatchPrefillCuteDSLWrapper:
         s_k = kv_indptr[1:] - kv_indptr[:-1]
 
         qo_shape = (1, torch.sum(s_q), h_r * self._num_kv_heads, self._head_dim)
-        qo_padding = (0, torch.max(s_q), 0, 0, 0)
+        o_padding = (0, torch.max(s_q), 0, 0, 0)
         kv_shape = (1, torch.sum(s_k), self._num_kv_heads, self._head_dim)
-        kv_padding = (0, torch.max(s_k), 0, 0, 0)
 
-        self._qo_padding = qo_padding[1]
-        self._kv_padding = kv_padding[1]
+        self._o_padding = o_padding[1]
+        self._kv_padding = 0
 
-        q_ref, q_cute, q_torch = create_and_pad_tensor(qo_shape, qo_padding, self._in_dtype, s_cumsum=s_cumsum_q_torch_tensor, is_dynamic_layout=True)
-        k_ref, k_cute, k_torch = create_and_pad_tensor(kv_shape, kv_padding, self._in_dtype, s_cumsum=s_cumsum_k_torch_tensor, is_dynamic_layout=True)
-        v_ref, v_cute, v_torch = create_and_pad_tensor(kv_shape, kv_padding, self._in_dtype, s_cumsum=s_cumsum_k_torch_tensor, is_dynamic_layout=True)
+        q_ref, q_cute, q_torch = create_and_pad_tensor(qo_shape, (0, 0, 0, 0, 0), self._in_dtype, s_cumsum=s_cumsum_q_torch_tensor, is_dynamic_layout=True)
+        k_ref, k_cute, k_torch = create_and_pad_tensor(kv_shape, (0, 0, 0, 0, 0), self._in_dtype, s_cumsum=s_cumsum_k_torch_tensor, is_dynamic_layout=True)
+        v_ref, v_cute, v_torch = create_and_pad_tensor(kv_shape, (0, 0, 0, 0, 0), self._in_dtype, s_cumsum=s_cumsum_k_torch_tensor, is_dynamic_layout=True)
 
         _, o_cute, o_torch = create_and_pad_tensor(
         qo_shape,
-        qo_padding,
+        o_padding,
         self._out_dtype,
         s_cumsum=s_cumsum_q_torch_tensor,
         is_dynamic_layout=True,
@@ -2709,6 +2708,8 @@ class BatchPrefillCuteDSLWrapper:
         self._problem_size = problem_size
         self._s_cumsum_q_cute_tensor = s_cumsum_q_cute_tensor
         self._s_cumsum_k_cute_tensor = s_cumsum_k_cute_tensor
+        self._s_q_all = s_cumsum_q_torch_tensor[-1].item()
+        self._s_k_all = s_cumsum_k_torch_tensor[-1].item()
 
         log2_e = math.log2(
             math.exp(1.0)
@@ -2732,7 +2733,9 @@ class BatchPrefillCuteDSLWrapper:
             o_cute.iterator,
             self._problem_size,
             self._s_cumsum_q_cute_tensor,
+            self._s_q_all,
             self._s_cumsum_k_cute_tensor,
+            self._s_k_all,
             self._scale_softmax_log2,
             self._scale_output,
             sink_cute.iterator if self._use_attention_sink else None,
@@ -2741,9 +2744,6 @@ class BatchPrefillCuteDSLWrapper:
 
 
         self._compiled_fmha = compiled_fmha
-
-    def register_logits_transform(self, logits_transform: Callable):
-        self._logits_transform = logits_transform
 
     def run(
         self,
@@ -2781,14 +2781,15 @@ class BatchPrefillCuteDSLWrapper:
             out = torch.empty_like(q, device=q.device)
 
         # Convert tensors to cute format
-        q_cute, q_torch = qkv_torch_2_cute(q, self._qo_padding, self._in_dtype)
-        k_cute, k_torch = qkv_torch_2_cute(k, self._kv_padding, self._in_dtype)
-        v_cute, v_torch = qkv_torch_2_cute(v, self._kv_padding, self._in_dtype)
-        o_cute, o_torch = qkv_torch_2_cute(out, self._qo_padding, self._out_dtype)
+        # Create dtype cute tensor with offset (gpu)
+        q_cute = from_dlpack(q, assumed_align=16)
+        k_cute = from_dlpack(k, assumed_align=16)
+        v_cute = from_dlpack(v, assumed_align=16)
+        o_cute, o_torch = qkv_torch_2_cute(out, self._o_padding, self._out_dtype)
 
         if self._use_attention_sink:
             assert sink is not None, "sink is required when use_attention_sink is True"
-            sink = sink.to(torch.float16)
+            assert sink.dtype == q.dtype, "sink must have the same dtype as q"
             sink_cute = from_dlpack(sink, assumed_align=16)
 
         # cute.printf("q_cute.shape {}", q_cute.shape)
@@ -2802,7 +2803,9 @@ class BatchPrefillCuteDSLWrapper:
             o_cute.iterator,
             self._problem_size,
             self._s_cumsum_q_cute_tensor,
+            self._s_q_all,
             self._s_cumsum_k_cute_tensor,
+            self._s_k_all,
             self._scale_softmax_log2,
             self._scale_output,
             sink_cute.iterator if self._use_attention_sink else None,
