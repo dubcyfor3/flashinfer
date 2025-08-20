@@ -47,6 +47,8 @@ import cutlass.cute.testing as testing
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import Int32, Int64, Float32, Boolean
 
+from .cutedsl_patch import pipeline as pipeline_patch
+
 from typing import Callable, Any
 from types import SimpleNamespace
 
@@ -816,7 +818,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
-        load_q_producer, load_q_consumer = pipeline.make_pipeline_participants(
+        load_q_producer, load_q_consumer = pipeline_patch.make_pipeline_participants(
             pipeline_type=pipeline.PipelineTmaUmma,
             barrier_storage=storage.load_q_mbar_ptr.data_ptr(),
             num_stages=self.q_stage,
@@ -824,7 +826,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             consumer_thread_count=len([self.mma_warp_id]),
             tx_count=self.tma_copy_q_bytes,
         )
-        load_kv_producer, load_kv_consumer = pipeline.make_pipeline_participants(
+        load_kv_producer, load_kv_consumer = pipeline_patch.make_pipeline_participants(
             pipeline_type=pipeline.PipelineTmaUmma,
             barrier_storage=storage.load_kv_mbar_ptr.data_ptr(),
             num_stages=self.kv_stage,
@@ -832,42 +834,42 @@ class BlackwellFusedMultiHeadAttentionForward:
             consumer_thread_count=len([self.mma_warp_id]),
             tx_count=self.tma_copy_kv_bytes,
         )
-        mma_s0_producer, mma_s0_consumer = pipeline.make_pipeline_participants(
+        mma_s0_producer, mma_s0_consumer = pipeline_patch.make_pipeline_participants(
             pipeline_type=pipeline.PipelineUmmaAsync,
             barrier_storage=storage.mma_s0_mbar_ptr.data_ptr(),
             num_stages=self.mma_softmax_stage,
             producer_thread_count=len([self.mma_warp_id]),
             consumer_thread_count=self.threads_per_warp * len(self.softmax0_warp_ids),
         )
-        mma_s1_producer, mma_s1_consumer = pipeline.make_pipeline_participants(
+        mma_s1_producer, mma_s1_consumer = pipeline_patch.make_pipeline_participants(
             pipeline_type=pipeline.PipelineUmmaAsync,
             barrier_storage=storage.mma_s1_mbar_ptr.data_ptr(),
             num_stages=self.mma_softmax_stage,
             producer_thread_count=len([self.mma_warp_id]),
             consumer_thread_count=self.threads_per_warp * len(self.softmax1_warp_ids),
         )
-        s0_corr_producer, s0_corr_consumer = pipeline.make_pipeline_participants(
+        s0_corr_producer, s0_corr_consumer = pipeline_patch.make_pipeline_participants(
             pipeline_type=pipeline.PipelineAsync,
             barrier_storage=storage.s0_corr_mbar_ptr.data_ptr(),
             num_stages=self.softmax_corr_stage,
             producer_thread_count=self.threads_per_warp * len(self.softmax0_warp_ids),
             consumer_thread_count=self.threads_per_warp * len(self.correction_warp_ids),
         )
-        s1_corr_producer, s1_corr_consumer = pipeline.make_pipeline_participants(
+        s1_corr_producer, s1_corr_consumer = pipeline_patch.make_pipeline_participants(
             pipeline_type=pipeline.PipelineAsync,
             barrier_storage=storage.s1_corr_mbar_ptr.data_ptr(),
             num_stages=self.softmax_corr_stage,
             producer_thread_count=self.threads_per_warp * len(self.softmax1_warp_ids),
             consumer_thread_count=self.threads_per_warp * len(self.correction_warp_ids),
         )
-        corr_epi_producer, corr_epi_consumer = pipeline.make_pipeline_participants(
+        corr_epi_producer, corr_epi_consumer = pipeline_patch.make_pipeline_participants(
             pipeline_type=pipeline.PipelineAsync,
             barrier_storage=storage.corr_epi_mbar_ptr.data_ptr(),
             num_stages=self.epi_stage,
             producer_thread_count=self.threads_per_warp * len(self.correction_warp_ids),
             consumer_thread_count=self.threads_per_warp * len([self.epilogue_warp_id]),
         )
-        mma_corr_producer, mma_corr_consumer = pipeline.make_pipeline_participants(
+        mma_corr_producer, mma_corr_consumer = pipeline_patch.make_pipeline_participants(
             pipeline_type=pipeline.PipelineUmmaAsync,
             barrier_storage=storage.mma_corr_mbar_ptr.data_ptr(),
             num_stages=self.mma_corr_stage,
@@ -875,7 +877,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             consumer_thread_count=self.threads_per_warp * len(self.correction_warp_ids),
         )
         s0_s1_sequence_producer, s0_s1_sequence_consumer = (
-            pipeline.make_pipeline_participants(
+            pipeline_patch.make_pipeline_participants(
                 pipeline_type=pipeline.PipelineAsync,
                 barrier_storage=storage.s0_s1_sequence_mbar_ptr.data_ptr(),
                 num_stages=1,
@@ -1749,11 +1751,11 @@ class BlackwellFusedMultiHeadAttentionForward:
     ) -> Tuple[
         Float32,
         Float32,
-        pipeline.PipelineProducer.ImmutableResourceHandle,
-        pipeline.PipelineConsumer,
-        pipeline.PipelineProducer,
-        pipeline.PipelineConsumer,
-        pipeline.PipelineProducer,
+        pipeline_patch.PipelineProducer.ImmutableResourceHandle,
+        pipeline_patch.PipelineConsumer,
+        pipeline_patch.PipelineProducer,
+        pipeline_patch.PipelineConsumer,
+        pipeline_patch.PipelineProducer,
     ]:
         """Perform a single step of the softmax computation on a block of attention scores.
 
@@ -1969,10 +1971,10 @@ class BlackwellFusedMultiHeadAttentionForward:
         tStS: cute.Tensor,
         tStSi: cute.Tensor,
         sink: cute.Tensor | None,
-        mma_si_consumer: pipeline.PipelineConsumer,
-        si_corr_producer: pipeline.PipelineProducer,
-        s0_s1_sequence_consumer: pipeline.PipelineConsumer,
-        s0_s1_sequence_producer: pipeline.PipelineProducer,
+        mma_si_consumer: pipeline_patch.PipelineConsumer,
+        si_corr_producer: pipeline_patch.PipelineProducer,
+        s0_s1_sequence_consumer: pipeline_patch.PipelineConsumer,
+        s0_s1_sequence_producer: pipeline_patch.PipelineProducer,
         tile_sched_params: FmhaStaticTileSchedulerParams,
     ):
         """Compute softmax on attention scores from QK matrix multiplication.
