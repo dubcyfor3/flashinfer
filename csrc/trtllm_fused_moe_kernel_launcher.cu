@@ -39,6 +39,7 @@
 namespace flashinfer {
 
 namespace btg = batchedGemm::trtllm::gen;
+using tensorrt_llm::kernels::trtllmgen_moe::MoE::GatedActType;
 using tensorrt_llm::kernels::trtllmgen_moe::Routing::RoutingMethodType;
 
 at::Tensor trtllm_fp8_per_tensor_scale_moe_launcher(
@@ -50,7 +51,7 @@ at::Tensor trtllm_fp8_per_tensor_scale_moe_launcher(
     int64_t const intermediate_size, int64_t const local_expert_offset,
     int64_t const local_num_experts, double const routed_scaling_factor,
     bool const use_routing_scales_on_input, int64_t const tile_tokens_dim,
-    int64_t const routing_method_type) {
+    int64_t const routing_method_type, bool enable_pdl) {
   auto device = hidden_states.device();
 
   static const std::tuple<int, int> device_props = [&device] {
@@ -96,6 +97,8 @@ at::Tensor trtllm_fp8_per_tensor_scale_moe_launcher(
   TORCH_CHECK(num_experts % 4 == 0,
               "Routing kernel expects that num_experts must be divisible by 4");
   TORCH_CHECK(num_experts > top_k, "num_experts must be greater than top_k");
+  TORCH_CHECK(local_num_experts + local_expert_offset <= num_experts,
+              "num_experts must be greater or equal to local_num_experts + local_expert_offset");
 
   tensorrt_llm::kernels::trtllmgen_moe::MoE::MoERunnerArgs args;
   tensorrt_llm::kernels::trtllmgen_moe::MoE::MoEWorkspace workspace;
@@ -282,7 +285,8 @@ at::Tensor trtllm_fp8_per_tensor_scale_moe_launcher(
   workspace.bmm1_workspace = workspace_fc1.data_ptr();
   workspace.bmm2_workspace = workspace_fc2.data_ptr();
   auto const& moe_stream = at::cuda::getCurrentCUDAStream(hidden_states.get_device());
-  moe_runner.run(args, workspace, hidden_states.get_device(), moe_stream, moeConfigIndex);
+  moe_runner.run(args, workspace, hidden_states.get_device(), moe_stream, moeConfigIndex,
+                 enable_pdl);
   return output;
 }
 
@@ -293,7 +297,7 @@ at::Tensor trtllm_fp8_per_tensor_scale_moe(
     at::Tensor output2_scales_scalar, int64_t num_experts, int64_t top_k, int64_t n_group,
     int64_t topk_group, int64_t intermediate_size, int64_t local_expert_offset,
     int64_t local_num_experts, double routed_scaling_factor, bool use_routing_scales_on_input,
-    int64_t tile_tokens_dim, int64_t routing_method_type) {
+    int64_t tile_tokens_dim, int64_t routing_method_type, bool enable_pdl) {
   auto dtype = hidden_states.dtype();
   if (dtype == at::ScalarType::Half || dtype == at::ScalarType::BFloat16 ||
       dtype == at::ScalarType::Float8_e4m3fn) {
@@ -301,7 +305,8 @@ at::Tensor trtllm_fp8_per_tensor_scale_moe(
         routing_logits, routing_bias, hidden_states, gemm1_weights, output1_scales_scalar,
         output1_scales_gate_scalar, gemm2_weights, output2_scales_scalar, num_experts, top_k,
         n_group, topk_group, intermediate_size, local_expert_offset, local_num_experts,
-        routed_scaling_factor, use_routing_scales_on_input, tile_tokens_dim, routing_method_type);
+        routed_scaling_factor, use_routing_scales_on_input, tile_tokens_dim, routing_method_type,
+        enable_pdl);
   } else {
     TORCH_CHECK(false, "Unsupported input type: ", dtype);
   }
@@ -316,7 +321,8 @@ at::Tensor trtllm_fp8_block_scale_moe_launcher(
     int64_t const intermediate_size, int64_t const local_expert_offset,
     int64_t const local_num_experts, double const routed_scaling_factor,
     int64_t const tile_tokens_dim, int64_t const routing_method_type,
-    tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner& moe_runner, int64_t moeConfigIndex) {
+    tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner& moe_runner, int64_t moeConfigIndex,
+    bool enable_pdl) {
   auto device = hidden_states.device();
 
   static const std::tuple<int, int> device_props = [&device] {
@@ -578,7 +584,8 @@ at::Tensor trtllm_fp8_block_scale_moe_launcher(
   workspace.bmm2_workspace = workspace_fc2.data_ptr();
 
   auto const& moe_stream = at::cuda::getCurrentCUDAStream(hidden_states.get_device());
-  moe_runner.run(args, workspace, hidden_states.get_device(), moe_stream, moeConfigIndex);
+  moe_runner.run(args, workspace, hidden_states.get_device(), moe_stream, moeConfigIndex,
+                 enable_pdl);
   return output;
 }
 
@@ -590,7 +597,7 @@ at::Tensor trtllm_fp8_block_scale_moe(
     int64_t top_k, int64_t n_group, int64_t topk_group, int64_t intermediate_size,
     int64_t local_expert_offset, int64_t local_num_experts, double routed_scaling_factor,
     int64_t tile_tokens_dim, int64_t routing_method_type, bool use_shuffled_weight,
-    int64_t weight_layout) {
+    int64_t weight_layout, bool enable_pdl) {
   auto dtype = hidden_states.dtype();
   if (dtype == at::ScalarType::Half || dtype == at::ScalarType::BFloat16 ||
       dtype == at::ScalarType::Float8_e4m3fn) {
@@ -618,7 +625,8 @@ at::Tensor trtllm_fp8_block_scale_moe(
         routing_logits, routing_bias, hidden_states, hidden_states_scale, gemm1_weights,
         gemm1_weights_scale, gemm2_weights, gemm2_weights_scale, num_experts, top_k, n_group,
         topk_group, intermediate_size, local_expert_offset, local_num_experts,
-        routed_scaling_factor, tile_tokens_dim, routing_method_type, *mRunner, moeConfigIndex);
+        routed_scaling_factor, tile_tokens_dim, routing_method_type, *mRunner, moeConfigIndex,
+        enable_pdl);
   } else {
     TORCH_CHECK(false, "Unsupported input type: ", dtype);
   }
@@ -644,7 +652,7 @@ std::vector<at::Tensor> trtllm_fp4_block_scale_moe_launcher(
     std::optional<double> const routed_scaling_factor, int64_t const tile_tokens_dim,
     int64_t const routing_method_type, bool const do_finalize,
     tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner& moe_runner, btg::Dtype dtype_act,
-    btg::Dtype dtype_weights, int64_t const moeConfigIndex, at::Tensor& output) {
+    btg::Dtype dtype_weights, int64_t const moeConfigIndex, bool enable_pdl, at::Tensor& output) {
   auto device = hidden_states.device();
 
   static const std::tuple<int, int> device_props = [&device] {
@@ -725,10 +733,11 @@ std::vector<at::Tensor> trtllm_fp4_block_scale_moe_launcher(
   } else if (static_cast<RoutingMethodType>(routing_method_type) ==
                  RoutingMethodType::Renormalize ||
              static_cast<RoutingMethodType>(routing_method_type) ==
-                 RoutingMethodType::RenormalizeNaive) {
+                 RoutingMethodType::RenormalizeNaive ||
+             static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::TopK) {
     TORCH_CHECK(
         top_k <= 8 && top_k > 0,
-        "Current routing kernel (no groups, renormalize) only supports top_k<=8 && top_k>0.");
+        "Current routing kernel (no groups, renormalize/topk) only supports top_k<=8 && top_k>0.");
   } else if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Llama4) {
     TORCH_CHECK(top_k == 1, "Current routing kernel (no groups, Llama4) only supports top_k=1.");
   }
@@ -816,8 +825,8 @@ std::vector<at::Tensor> trtllm_fp4_block_scale_moe_launcher(
 
   std::optional<at::Tensor> gemm1_output_scale = std::nullopt;
   if (dtype_act == btg::Dtype::E2m1 || dtype_act == btg::Dtype::MxE4m3) {
-    int64_t sf_size = tensorrt_llm::computeFP4SwizzledLayoutSFSize(max_num_padded_tokens,
-                                                                   intermediate_size / sf_vec_size);
+    int64_t sf_size = tensorrt_llm::computeSwizzledLayoutSFSize(max_num_padded_tokens,
+                                                                intermediate_size / sf_vec_size);
     gemm1_output_scale = at::detail::empty_cuda({sf_size}, at::ScalarType::Float8_e4m3fn,
                                                 hidden_states.device(), std::nullopt);
   }
@@ -874,11 +883,10 @@ std::vector<at::Tensor> trtllm_fp4_block_scale_moe_launcher(
     TORCH_CHECK(hidden_states_scale.value().scalar_type() == at::ScalarType::Float8_e4m3fn,
                 "hidden_states_scale must be fp8.");
 
-    TORCH_CHECK(hidden_states_scale.value().dim() == 1, "hidden_states_scale must be 1D.");
-    TORCH_CHECK(hidden_states_scale.value().sizes()[0] ==
-                    tensorrt_llm::computeFP4LinearLayoutSFSize(args.num_tokens,
-                                                               args.hidden_size / sf_vec_size),
-                "hidden_states_scale has incorrect size");
+    TORCH_CHECK(
+        hidden_states_scale.value().numel() == tensorrt_llm::computeLinearLayoutSFSize(
+                                                   args.num_tokens, args.hidden_size / sf_vec_size),
+        "hidden_states_scale has incorrect size");
   }
 
   TORCH_CHECK(gemm1_weights.scalar_type() == torch_ext::FLOAT4_E2M1X2,
@@ -1028,7 +1036,8 @@ std::vector<at::Tensor> trtllm_fp4_block_scale_moe_launcher(
   workspace.bmm1_workspace = workspace_fc1.data_ptr();
   workspace.bmm2_workspace = workspace_fc2.data_ptr();
   auto const& moe_stream = at::cuda::getCurrentCUDAStream(hidden_states.get_device());
-  moe_runner.run(args, workspace, hidden_states.get_device(), moe_stream, moeConfigIndex);
+  moe_runner.run(args, workspace, hidden_states.get_device(), moe_stream, moeConfigIndex,
+                 enable_pdl);
 
   if (!do_finalize) {
     return {gemm2_output, expert_weights, expanded_idx_to_permuted_idx};
@@ -1051,7 +1060,8 @@ std::vector<at::Tensor> trtllm_fp4_block_scale_moe(
     std::optional<int64_t> n_group, std::optional<int64_t> topk_group, int64_t intermediate_size,
     int64_t local_expert_offset, int64_t local_num_experts,
     std::optional<double> routed_scaling_factor, int64_t tile_tokens_dim,
-    int64_t routing_method_type, bool do_finalize, at::Tensor& output) {
+    int64_t routing_method_type, bool do_finalize, bool enable_pdl, int64_t gated_act_type,
+    at::Tensor& output, int64_t config_index) {
   using RunnerType = tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner;
 
   int const num_tokens = hidden_states.sizes()[0];
@@ -1062,7 +1072,7 @@ std::vector<at::Tensor> trtllm_fp4_block_scale_moe(
     hidden_states_scale_vec_size = (num_tokens * hidden_size) / hidden_states_scale.value().numel();
   }
   int weight_scale_vec_size =
-      (num_experts * intermediate_size * 2 * hidden_size) / gemm1_weights_scale.numel();
+      (local_num_experts * intermediate_size * 2 * hidden_size) / gemm1_weights_scale.numel();
   TORCH_CHECK(weight_scale_vec_size == 16 || weight_scale_vec_size == 32,
               "unsupported weight_scale_vec_size.");
   auto mDtypeWeights = weight_scale_vec_size == 16 ? btg::Dtype::E2m1 : btg::Dtype::MxE2m1;
@@ -1102,10 +1112,12 @@ std::vector<at::Tensor> trtllm_fp4_block_scale_moe(
   // Properly initialize the runner using make_unique like in the original code
   auto mRunner = std::make_unique<RunnerType>(
       mDtypeAct, mDtypeWeights, mUseDeepSeekFp8, (int32_t)tile_tokens_dim,
-      tensorrt_llm::kernels::ActType::SwiGlu, /*useShuffledMatrixA*/ true);
+      static_cast<GatedActType>(gated_act_type), /*useShuffledMatrixA*/ true);
 
-  auto const moeConfigIndex = mRunner->getDefaultValidConfigIndex(
-      top_k, hidden_size, intermediate_size, local_num_experts, num_tokens);
+  if (config_index == -1) {
+    config_index = mRunner->getDefaultValidConfigIndex(top_k, hidden_size, intermediate_size,
+                                                       local_num_experts, num_tokens);
+  }
 
   return trtllm_fp4_block_scale_moe_launcher(
       routing_logits, topk_ids, expert_weights, routing_bias, hidden_states, hidden_states_scale,
@@ -1114,7 +1126,36 @@ std::vector<at::Tensor> trtllm_fp4_block_scale_moe(
       output1_scales_gate_scalar, output2_scales_scalar, num_experts, top_k, n_group, topk_group,
       intermediate_size, local_expert_offset, local_num_experts, routed_scaling_factor,
       tile_tokens_dim, routing_method_type, do_finalize, *mRunner, mDtypeAct, mDtypeWeights,
-      moeConfigIndex, output);
+      config_index, enable_pdl, output);
+}
+
+int64_t trtllm_get_default_moe_configs(int64_t const tile_tokens_dim, int64_t const dtype_act_,
+                                       int64_t const dtype_weights_, bool const useDeepSeekFp8,
+                                       int64_t const top_k, int64_t const hidden_size,
+                                       int64_t const intermediate_size,
+                                       int64_t const num_local_experts,
+                                       int64_t const gated_act_type, int64_t const num_tokens) {
+  auto dtype_act = static_cast<btg::Dtype>(dtype_act_);
+  auto dtype_weights = static_cast<btg::Dtype>(dtype_weights_);
+  tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner moe_runner(
+      dtype_act, dtype_weights, useDeepSeekFp8, (int32_t)tile_tokens_dim,
+      static_cast<GatedActType>(gated_act_type), /*useShuffledMatrixA*/ true);
+  return moe_runner.getDefaultValidConfigIndex(top_k, hidden_size, intermediate_size,
+                                               num_local_experts, num_tokens);
+}
+
+std::vector<int64_t> trtllm_get_valid_moe_configs(
+    int64_t const tile_tokens_dim, int64_t const dtype_act_, int64_t const dtype_weights_,
+    bool const useDeepSeekFp8, int64_t const top_k, int64_t const hidden_size,
+    int64_t const intermediate_size, int64_t const num_local_experts, int64_t const gated_act_type,
+    int64_t const num_tokens) {
+  auto dtype_act = static_cast<btg::Dtype>(dtype_act_);
+  auto dtype_weights = static_cast<btg::Dtype>(dtype_weights_);
+  tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner moe_runner(
+      dtype_act, dtype_weights, useDeepSeekFp8, (int32_t)tile_tokens_dim,
+      static_cast<GatedActType>(gated_act_type), /*useShuffledMatrixA*/ true);
+  return moe_runner.getValidConfigIndices(top_k, hidden_size, intermediate_size, num_local_experts,
+                                          num_tokens);
 }
 
 namespace trtllm_cubin_loader {
@@ -1125,6 +1166,8 @@ TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   m.def("trtllm_fp8_per_tensor_scale_moe", trtllm_fp8_per_tensor_scale_moe);
   m.def("trtllm_fp8_block_scale_moe", trtllm_fp8_block_scale_moe);
   m.def("trtllm_fp4_block_scale_moe", trtllm_fp4_block_scale_moe);
+  m.def("trtllm_get_default_moe_configs", trtllm_get_default_moe_configs);
+  m.def("trtllm_get_valid_moe_configs", trtllm_get_valid_moe_configs);
 }
 
 }  // namespace flashinfer

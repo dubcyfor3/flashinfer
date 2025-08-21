@@ -15,7 +15,7 @@ limitations under the License.
 """
 
 import os
-from typing import List, Optional
+from typing import List
 
 import jinja2
 import torch
@@ -385,6 +385,28 @@ def get_batch_prefill_uri(
         f"use_swa_{use_sliding_window}_"
         f"use_logits_cap_{use_logits_soft_cap}_"
         f"f16qk_{use_fp16_qk_reduction}" + ("_sm90" if backend == "fa3" else "")
+    )
+
+
+def get_batch_prefill_attention_sink_uri(
+    backend: str,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    pos_encoding_mode: int,
+    use_sliding_window: bool,
+) -> str:
+    return (
+        f"batch_prefill_with_attention_sink_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
+        f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
+        f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
+        f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
+        f"head_dim_qk_{head_dim_qk}_"
+        f"head_dim_vo_{head_dim_vo}_"
+        f"use_swa_{use_sliding_window}_" + ("_sm90" if backend == "fa3" else "")
     )
 
 
@@ -856,6 +878,54 @@ def gen_batch_prefill_module(
     )
 
 
+def gen_batch_prefill_attention_sink_module(
+    backend: str,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    pos_encoding_mode: int,
+    use_sliding_window: bool,
+) -> JitSpec:
+    from flashinfer.jit.attention.variants import attention_sink_decl
+
+    uri = get_batch_prefill_attention_sink_uri(
+        backend,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        dtype_idx,
+        head_dim_qk,
+        head_dim_vo,
+        pos_encoding_mode,
+        use_sliding_window,
+    )
+
+    return gen_customize_batch_prefill_module(
+        backend,
+        uri,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        dtype_idx,
+        head_dim_qk,
+        head_dim_vo,
+        ["sink"],
+        ["float"],
+        ["sm_scale"],
+        ["double"],
+        "AttentionSink",
+        attention_sink_decl[backend],
+        pos_encoding_mode=pos_encoding_mode,
+        use_sliding_window=use_sliding_window,
+        use_logits_soft_cap=False,
+        use_fp16_qk_reduction=False,
+        fp8_enabled=False,
+    )
+
+
 def gen_batch_attention_module(
     dtype_q: torch.dtype,
     dtype_kv: torch.dtype,
@@ -879,12 +949,12 @@ def gen_batch_attention_module(
         use_profiler,
     )
 
-    additional_tensor_names = []
-    additional_tensor_dtypes = []
-    additional_scalar_names = []
-    additional_scalar_dtypes = []
+    additional_tensor_names: List[str] = []
+    additional_tensor_dtypes: List[str] = []
+    additional_scalar_names: List[str] = []
+    additional_scalar_dtypes: List[str] = []
     variant_name = f"StandardAttention<{str(use_logits_soft_cap).lower()}>"
-    variant_decl = f"#include<flashinfer/attention/variants.cuh>"
+    variant_decl = "#include<flashinfer/attention/variants.cuh>"
 
     return gen_customize_batch_attention_module(
         uri,

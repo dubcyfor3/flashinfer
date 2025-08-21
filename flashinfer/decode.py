@@ -21,9 +21,8 @@ from typing import Any, List, Literal, Optional, Tuple, Union, overload
 
 import torch
 
-from .cudnn import cudnn_batch_decode_with_kv_cache
+from .cudnn import cudnn_batch_decode_with_kv_cache as cudnn_batch_decode_with_kv_cache
 from .jit import (
-    cudnn_fmha_gen_module,
     gen_batch_decode_mla_module,
     gen_batch_decode_module,
     gen_customize_batch_decode_module,
@@ -58,8 +57,11 @@ from .utils import (
     canonicalize_torch_dtype,
     device_support_pdl,
     get_device_sm_count,
+    is_float8,
     register_custom_op,
     register_fake_op,
+    ceil_div,
+    round_up,
 )
 
 
@@ -593,7 +595,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
     >>> max_num_pages = 128
     >>> page_size = 16
     >>> # allocate 128MB workspace buffer
-    >>> workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
+    >>> workspace_buffer = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
     >>> decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
     ...     workspace_buffer, "NHD"
     ... )
@@ -658,7 +660,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         Parameters
         ----------
-        float_workspace_buffer : torch.Tensor
+        float_workspace_buffer : torch.Tensor. Must be initialized to 0 for its first use.
             The user reserved float workspace buffer used to store intermediate attention results
             in the split-k algorithm. The recommended size is 128MB, the device of the workspace
             buffer should be the same as the device of the input tensors.
@@ -1192,10 +1194,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
         if self._kv_layout == "NHD":
             page_size = k_cache.shape[1]
-            stride_n = k_cache.stride(1)
         else:
             page_size = k_cache.shape[2]
-            stride_n = k_cache.stride(2)
         _check_cached_qkv_data_type(
             q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
         )
@@ -1290,6 +1290,13 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
             self._cached_module.paged_run(*run_args)
         else:
+            # trtllm-gen does not need plan info
+            if self._backend == "trtllm-gen" and self._plan_info is None:
+                plan_info: List[int] = []
+            else:
+                plan_info = self._plan_info
+            assert plan_info is not None, "plan info is not initialized"
+
             run_args = [
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
@@ -1321,8 +1328,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._cached_module.run(*run_args)
         if v_scale is not None:
             # TODO(Zihao): fused into kernel
-            if out.itemsize == 1:
-                out = (out.to(float) * v_scale).to(out.dtype)
+            if is_float8(out):
+                out = (out.to(torch.float32) * v_scale).to(out.dtype)
             else:
                 out *= v_scale
 
@@ -1791,6 +1798,18 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
 
 
 class TrtllmGenDecodeModule:
+    def __init__(self) -> None:
+        self._sm_count: Optional[int] = None
+        self._mod = trtllm_gen_fmha_module()
+        self._op = self._mod.build_and_load()
+        from flashinfer.jit.cubin_loader import (
+            setup_cubin_loader,
+            setup_metainfo_loader,
+        )
+
+        setup_cubin_loader(self._mod.get_library_path())
+        setup_metainfo_loader(self._mod.get_library_path())
+
     def _paged_run(
         self,
         query: torch.Tensor,
@@ -1803,6 +1822,7 @@ class TrtllmGenDecodeModule:
         bmm1_scale: float,  # todo(Yingyi): add dynamic scale tensor later
         bmm2_scale: float,
         window_left: int = -1,
+        enable_pdl: bool = None,
         out: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -1810,6 +1830,7 @@ class TrtllmGenDecodeModule:
             out = torch.empty_like(query)
         if self._sm_count is None:
             self._sm_count = get_device_sm_count(query.device)
+
         self._op.trtllm_paged_attention_decode(
             out,
             None,  # fp4 output not supported in wrapper api yet.
@@ -1829,24 +1850,13 @@ class TrtllmGenDecodeModule:
             0,  # o_sf_start_index
             window_left,
             self._sm_count,
+            enable_pdl,
             sinks,
         )
         return out
 
     def _plan(self, *args, **kwargs):
         pass
-
-    def __init__(self):
-        self._sm_count: Optional[int] = None
-        self._mod = trtllm_gen_fmha_module()
-        self._op = self._mod.build_and_load()
-        from flashinfer.jit.cubin_loader import (
-            setup_cubin_loader,
-            setup_metainfo_loader,
-        )
-
-        setup_cubin_loader(self._mod.get_library_path())
-        setup_metainfo_loader(self._mod.get_library_path())
 
 
 @functools.cache
@@ -1911,6 +1921,7 @@ def get_trtllm_gen_decode_module(*args):
         assert kv_lens_buffer is not None
         assert page_size is not None
         assert max_kv_len is not None
+        assert enable_pdl is not None
         o = module._paged_run(
             q.contiguous(),  # NOTE(Siyuan): without contiguous, the result is incorrect
             paged_k_cache,
@@ -1922,6 +1933,7 @@ def get_trtllm_gen_decode_module(*args):
             sm_scale,
             1.0,  # NOTE(Siyuan): update this to expose bmm2 scale
             window_left,
+            enable_pdl,
             out=o,
             sinks=sinks,
         )
@@ -1991,6 +2003,7 @@ def trtllm_batch_decode_with_kv_cache(
     o_sf_scale: Optional[float] = None,
     o_sf_vec_size: Optional[int] = None,
     sinks: Optional[List[torch.Tensor]] = None,
+    enable_pdl: bool = None,
 ) -> Union[torch.Tensor, FP4Tensor]:
     """
     Parameters
@@ -2002,7 +2015,7 @@ def trtllm_batch_decode_with_kv_cache(
         If kv_cache is a single tensor, it should be a tensor with shape [num_pages, 1 or 2, num_kv_heads, page_size, head_dim]
         If kv_cache is a tuple of two tensors, it should be a tuple of two tensors with shape [num_pages, num_kv_heads, page_size, head_dim]
 
-    workspace_buffer : torch.Tensor
+    workspace_buffer : torch.Tensor. Must be initialized to 0 for its first use.
         workspace
 
     block_tables : torch.Tensor
@@ -2039,11 +2052,16 @@ def trtllm_batch_decode_with_kv_cache(
     sinks : Optional[List[torch.Tensor]] = None
         additional value per head in the denominator of the softmax.
 
+    enable_pdl : bool
+        Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
+        Only supported for >= sm90, and currently only for FA2, CUDA core, and trtllm-gen decode.
+
     Returns
     -------
     out : Union[torch.Tensor, FP4Tensor]
         output torch.Tensor or FP4Tensor.
     """
+    enable_pdl = device_support_pdl(query.device) if enable_pdl is None else enable_pdl
 
     if isinstance(kv_cache, tuple):
         k_cache, v_cache = kv_cache
@@ -2051,9 +2069,9 @@ def trtllm_batch_decode_with_kv_cache(
         if kv_cache.shape[1] == 1:
             k_cache, v_cache = kv_cache, kv_cache
         else:
-            assert (
-                kv_cache.shape[1] == 2
-            ), "When kv_cache is a single tensor, the second dimension must be 1 or 2"
+            assert kv_cache.shape[1] == 2, (
+                "When kv_cache is a single tensor, the second dimension must be 1 or 2"
+            )
             # NOTE(Zihao): unbind transforms [num_pages, 2, ...] to ([num_pages, ...], [num_pages, ...])
             # it doesn't change underlying storage
             k_cache, v_cache = kv_cache.unbind(dim=1)
@@ -2062,25 +2080,28 @@ def trtllm_batch_decode_with_kv_cache(
     sm_count = get_device_sm_count(query.device)
 
     if out_dtype == "nvfp4" or (out_dtype is None and isinstance(out, FP4Tensor)):
-        assert (
-            query.dtype == torch.float8_e4m3fn
-        ), "query must be fp8 when out_dtype is nvfp4."
+        assert query.dtype == torch.float8_e4m3fn, (
+            "query must be fp8 when out_dtype is nvfp4."
+        )
         assert o_sf_scale is not None
         assert o_sf_vec_size in [None, 16], "only o_sf_vec_size = 16 is supported"
         o_sf_vec_size = o_sf_vec_size or 16
 
-        fp4_out_shape = query.shape[:-1] + (math.ceil(query.shape[-1] / 2),)
-
-        fp4_out_scale_shape = (
-            math.ceil(query.shape[0] / 128) * 128,
-            math.ceil(query.shape[1] * query.shape[2] / o_sf_vec_size / 4) * 4,
-        )
+        fp4_out_shape = query.shape[:-1] + (ceil_div(query.shape[-1], 2),)
 
         if isinstance(out, FP4Tensor):
+            fp4_out_scale_shape = (
+                out.scale.shape[0],
+                round_up(query.shape[1] * query.shape[2] // o_sf_vec_size, 4),
+            )
             out_scale_factor = out.scale
             o_sf_start_index = out.scale_start_index
             out = out.data
         elif out is None:
+            fp4_out_scale_shape = (
+                round_up(query.shape[0], 128),
+                round_up(query.shape[1] * query.shape[2] // o_sf_vec_size, 4),
+            )
             out_scale_factor = torch.empty(
                 fp4_out_scale_shape, dtype=torch.float8_e4m3fn, device=query.device
             )
@@ -2089,9 +2110,11 @@ def trtllm_batch_decode_with_kv_cache(
         else:
             raise ValueError(f"Invalid out: {out}")
 
-        _check_shape_dtype_device(out, fp4_out_shape, torch.uint8, query.device, "out")
+        assert isinstance(out, torch.Tensor)
 
         # Use uint8 as the container dtype to compliant with next fp4 gemm.
+        _check_shape_dtype_device(out, fp4_out_shape, torch.uint8, query.device, "out")
+
         _check_shape_dtype_device(
             out_scale_factor,
             fp4_out_scale_shape,
@@ -2099,6 +2122,18 @@ def trtllm_batch_decode_with_kv_cache(
             query.device,
             "out_scale_factor",
         )
+
+        # Check o_sf_start_index is valid
+        if (
+            o_sf_start_index < 0
+            or o_sf_start_index + out.shape[0] > out_scale_factor.shape[0]
+        ):
+            raise ValueError(
+                f"o_sf_start_index is out of the valid range of out_scale_factor. "
+                f"o_sf_start_index={o_sf_start_index}, out.shape[0]={out.shape[0]}, "
+                f"out_scale_factor.shape[0]={out_scale_factor.shape[0]}"
+            )
+
     elif isinstance(out_dtype, torch.dtype) or out_dtype is None:
         assert o_sf_scale is None
         assert o_sf_vec_size is None
@@ -2127,6 +2162,7 @@ def trtllm_batch_decode_with_kv_cache(
         o_sf_start_index,
         window_left,
         sm_count,
+        enable_pdl,
         sinks,
     )
 
@@ -2195,12 +2231,13 @@ def trtllm_batch_decode_with_kv_cache_mla(
     bmm1_scale_log2_tensor: Optional[torch.Tensor] = None,
     bmm2_scale_tensor: Optional[torch.Tensor] = None,
     sinks: Optional[List[torch.Tensor]] = None,
+    enable_pdl: bool = None,
 ) -> torch.Tensor:
     """
     Parameters:
     query: [batch_size, q_len_per_request, num_heads, head_dim_qk], head_dim_qk = qk_nope_head_dim (kv_lora_rank) + qk_rope_head_dim, should be concated q_nope + q_rope; q_len_per_request is the MTP query length.
     kv_cache: [num_pages, page_size, head_dim_ckv + head_dim_kpe], should be concated ckv_cache + kpe_cache
-    workspace_buffer: [num_semaphores, 4], used for multi_block mode
+    workspace_buffer: [num_semaphores, 4], used for multi_block mode. Must be initialized to 0 for its first use.
     qk_nope_head_dim: qk_nope_head_dim, must be 128
     kv_lora_rank: kv_lora_rank, must be 512
     qk_rope_head_dim: qk_rope_head_dim, must be 64
@@ -2232,6 +2269,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
         - Currently, only fp8 tensor core operation supports this mode.
     When both are provided, the dynamic scale factor tensors will be used.
     """
+    enable_pdl = device_support_pdl(query.device) if enable_pdl is None else enable_pdl
     run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_decode
     sm_count = get_device_sm_count(query.device)
 
@@ -2288,6 +2326,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
         0,  # o_sf_start_index
         -1,  # window_left
         sm_count,
+        enable_pdl,
         sinks,
     )
     return out
